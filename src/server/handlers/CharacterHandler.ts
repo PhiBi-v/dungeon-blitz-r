@@ -1036,7 +1036,16 @@ export class CharacterHandler {
                  const normalizedTarget = LevelConfig.normalizeLevelName(currentLevelName);
                  // Search active sessions for a party member in the same dungeon
                  for (const other of GlobalState.sessionsByToken.values()) {
-                     if (!other.playerSpawned || !other.character) continue;
+                     // Not `playerSpawned`: a party member whose client is still loading the
+                     // dungeon SWF is already bound to that dungeon's instance, and their
+                     // pending transfer entry is gone. Skipping them here is what let a player
+                     // logging in during that window open a second instance of the same run,
+                     // leaving both players invisible to each other for good.
+                     if (!GlobalState.isSessionOpen(other) || !other.character) continue;
+                     // A player walking *out* of the dungeon also still reports it as their
+                     // current level until their next login lands. Their instance binding is
+                     // already wiped, which is what separates them from an arriving member.
+                     if (!other.playerSpawned && !normalizeLevelInstanceId(other.levelInstanceId)) continue;
                      if (LevelConfig.normalizeLevelName(other.currentLevel) !== normalizedTarget) continue;
                      if (!areClientsInSameParty(client, other)) continue;
                      if (normalizeCharacterKey(other.character.name) === normalizeCharacterKey(char.name)) continue;

@@ -483,15 +483,49 @@ export class LevelHandler {
         return resolveConfirmedGroundedPosition(entity, expectedLevel);
     }
 
+    /**
+     * A party member counts as an anchor from the moment their session is bound to the
+     * target level, not from the moment their body appears in it.
+     *
+     * `playerSpawned` only flips when the destination client sends its first entity full
+     * update, which is after the whole level SWF has downloaded and loaded -- seconds for a
+     * dungeon. The pending transfer entry that covered the earlier part of the trip is
+     * already deleted by then (handleGameServerLogin consumes it), so requiring
+     * `playerSpawned` here left a multi-second hole in which a party member walking through
+     * the same door resolved *no* anchor at all. They allocated their own dungeon instance,
+     * and since the scope key is `levelName#levelInstanceId`, the two ended up in separate
+     * entity maps: neither player was ever sent the other, on either screen, for the rest of
+     * the run.
+     *
+     * A loading session carries everything the anchor decision actually needs -- instance id,
+     * run owner, start time, room progress. The one thing it does not carry is a position,
+     * and that stays gated on a confirmed grounded sample below, so a joiner is still never
+     * placed onto a point nobody has been seen standing on.
+     *
+     * An unspawned session is only accepted when it is arriving. A player *leaving* the level
+     * looks similar -- clearTransferState drops playerSpawned but leaves currentLevel pointing
+     * at the level they are walking out of -- and must not anchor anybody. The two are told
+     * apart by the bound dungeon instance, which login sets and clearTransferState wipes.
+     */
+    private static isInboundTransferSyncAnchorSession(session: Client, targetLevel: string): boolean {
+        if (session.playerSpawned) {
+            return true;
+        }
+
+        return LevelConfig.isDungeonLevel(targetLevel) &&
+            Boolean(normalizeLevelInstanceId(session.levelInstanceId)) &&
+            GlobalState.sessionsByToken.get(session.token) === session;
+    }
+
     private static buildActiveTransferSyncAnchorCandidate(
         session: Client,
         targetLevel: string
     ): TransferSyncAnchorCandidate | null {
         if (
             !GlobalState.isSessionOpen(session) ||
-            !session.playerSpawned ||
             !session.character ||
-            LevelConfig.normalizeLevelName(session.currentLevel) !== targetLevel
+            LevelConfig.normalizeLevelName(session.currentLevel) !== targetLevel ||
+            !LevelHandler.isInboundTransferSyncAnchorSession(session, targetLevel)
         ) {
             return null;
         }
@@ -505,7 +539,10 @@ export class LevelHandler {
             x = grounded.x;
             y = grounded.y;
             hasCoord = true;
-        } else {
+        } else if (session.playerSpawned) {
+            // Only a session that has actually appeared in the level may fall back to its
+            // saved coordinate. A session still loading has not stood anywhere in there yet,
+            // so its saved point is about some earlier visit and is not floor to arrive on.
             const savedLevel = session.character.CurrentLevel;
             if (
                 LevelConfig.normalizeLevelName(savedLevel?.name) === targetLevel &&
