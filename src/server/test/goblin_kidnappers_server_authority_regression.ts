@@ -536,7 +536,7 @@ function testTagUgoUsesCanonicalServerStatsAndHpSync(): void {
     );
     assert.equal(canonicalBoss.id, TutorialDungeonMechanics.TAG_UGO_BOSS_ID);
     assert.equal(canonicalBoss.clientSpawned, false);
-    assert.equal(canonicalBoss.level, EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL);
+    assert.equal(canonicalBoss.level, EntityHandler.resolveServerAuthorityEntityLevel('TutorialDungeon'));
     assert.ok(canonicalBoss.maxHp > 0, 'Tag Ugo should receive canonical server max HP');
     assert.equal(canonicalBoss.hp, canonicalBoss.maxHp, 'Tag Ugo should begin at canonical full HP');
     assert.equal(
@@ -577,7 +577,7 @@ function testTagUgoUsesOneClientVisualBackedByCanonicalServerBoss(): void {
     assert.ok(visualBoss, 'the cinematic client cue should become the sole local Tag Ugo visual');
     assert.equal(visualBoss.clientSpawned, true);
     assert.equal(visualBoss.canonicalEntityId, TutorialDungeonMechanics.TAG_UGO_BOSS_ID);
-    assert.equal(visualBoss.level, EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL);
+    assert.equal(visualBoss.level, EntityHandler.resolveServerAuthorityEntityLevel('TutorialDungeon'));
     assert.equal(visualBoss.maxHp, canonicalBoss.maxHp, 'visual boss should inherit canonical server stats');
     assert.equal(visualBoss.hp, canonicalBoss.hp, 'visual boss should inherit canonical server HP');
     assert.equal(

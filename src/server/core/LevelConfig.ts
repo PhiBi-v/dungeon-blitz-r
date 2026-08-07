@@ -455,6 +455,28 @@ export class LevelConfig {
         return Math.max(0, Math.round(spec.mapId - spec.baseId));
     }
 
+    /**
+     * The difficulty tier the dungeon itself is authored at, or 0 outside a dungeon.
+     *
+     * `mapId` is that tier: for a normal dungeon it equals `baseId` (JC_Mini2 is 29/29),
+     * and for a Dread run it is the raised tier the region jumps to (JC_Mini2Hard is
+     * 44/29). It belongs to the level, so it is the same number for everyone standing in
+     * it -- which is the point. Enemy difficulty used to be derived from the highest
+     * player level in the run, so a level 22 and a level 50 in the same dungeon could be
+     * handed different enemies whenever anything about who-is-in-which-scope hiccuped,
+     * and the party's own composition silently retuned the dungeon.
+     */
+    static getAuthoredDungeonEnemyLevel(levelName: string | null | undefined): number {
+        const normalized = this.normalizeLevelName(levelName);
+        const spec = normalized ? this.LEVELS[normalized] : null;
+        if (!spec?.isDungeon) {
+            return 0;
+        }
+
+        const tier = Math.round(Number(spec.mapId) || 0);
+        return tier > 0 ? Math.max(1, Math.min(50, tier)) : 0;
+    }
+
     // Which row of the hostile health table an enemy is sized from.
     //
     // Outside a Dread run this is the entity's own runtime level, which dungeons

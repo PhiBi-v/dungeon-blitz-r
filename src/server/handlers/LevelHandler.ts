@@ -770,6 +770,24 @@ export class LevelHandler {
 
         const candidates = LevelHandler.collectPartyTransferSyncAnchorCandidates(client, targetLevel);
         const anchor = candidates[0] ?? null;
+        // This is where a party member entering a dungeon decides whose run to join.
+        // Losing the anchor here is what strands them in a private instance with their
+        // own copy of every enemy, so make the decision visible either way.
+        const partyId = getPartyIdForClient(client);
+        if (partyId > 0) {
+            if (anchor) {
+                console.log(
+                    `[TransferAnchor] ${client.character?.name ?? '?'} -> ${targetLevel} joining ` +
+                    `${anchor.characterName ?? anchor.characterKey} instance=${anchor.state.levelInstanceId ?? '(none)'}`
+                );
+            } else {
+                console.warn(
+                    `[TransferAnchor] ${client.character?.name ?? '?'} -> ${targetLevel} found NO party anchor ` +
+                    `(partyId=${partyId}, sessionsInParty=${GlobalState.getSessionsInParty(partyId).size}) — ` +
+                    'will open a private instance unless the scope guard adopts one later.'
+                );
+            }
+        }
         if (!anchor || anchor.state.hasCoord) {
             return anchor;
         }
@@ -1109,6 +1127,34 @@ export class LevelHandler {
             };
         }
 
+        const activeDoorId = (
+            LevelConfig.normalizeLevelName(client.lastDoorTargetLevel) === normalizedTargetLevel
+        )
+            ? client.lastDoorId
+            : null;
+
+        // Walking through a door inside the dungeon you are already in is a reload of that
+        // level, not a join. The party-anchor coordinate below exists to put someone
+        // *entering* the dungeon next to the party; replaying it here teleports a player who
+        // only opened a door onto their party member's body somewhere else on the map -- and
+        // a point measured under another body in another room is a point this room's
+        // collision need not have floor under. The client only snaps a spawn onto floor
+        // within its 59px-above/160px-down ray, so anything further is accepted as given and
+        // the body glides to the ground: both players falling out of the air at the door and
+        // in the boss room behind it.
+        //
+        // The door's own authored spawn is floor by construction, and where a door has none,
+        // no coordinate at all is the right answer -- the client then places the body on the
+        // level's own spawn marker, which is also floor.
+        const isInternalDungeonDoorReload =
+            !preferExplicitSpawn &&
+            Boolean(normalizedOldLevel) &&
+            normalizedOldLevel === normalizedTargetLevel &&
+            LevelConfig.isDungeonLevel(normalizedTargetLevel);
+        if (isInternalDungeonDoorReload) {
+            return LevelConfig.getSpawnCoordinates(activeCharacter, oldLevel, targetLevel, activeDoorId);
+        }
+
         if (syncState?.hasCoord) {
             return {
                 x: Math.round(Number(syncState.x ?? 0)),
@@ -1117,11 +1163,6 @@ export class LevelHandler {
             };
         }
 
-        const activeDoorId = (
-            LevelConfig.normalizeLevelName(client.lastDoorTargetLevel) === normalizedTargetLevel
-        )
-            ? client.lastDoorId
-            : null;
         return LevelConfig.getSpawnCoordinates(activeCharacter, oldLevel, targetLevel, activeDoorId);
     }
 
@@ -1316,8 +1357,16 @@ export class LevelHandler {
 
     private static broadcastSharedDungeonQuestProgress(levelScope: string, progress: number): void {
         const payload = LevelHandler.buildQuestProgressPayload(progress);
-        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
-            if (!other.playerSpawned) {
+
+        // Resolve the audience by scanning live sessions rather than trusting
+        // `sessionsByLevelScope`. That index is refreshed lazily and was observed
+        // dropping a player mid-run -- the broadcast then reached only one of two party
+        // members and their progress bars silently diverged (20% vs 0%). This runs on
+        // enemy death, not per frame, so the scan is affordable and correctness wins.
+        const indexed = new Set(GlobalState.getSessionsInLevelScope(levelScope));
+        const missedByIndex: string[] = [];
+        for (const other of GlobalState.sessionsByToken.values()) {
+            if (!other.playerSpawned || getClientLevelScope(other) !== levelScope) {
                 continue;
             }
 
@@ -1325,6 +1374,19 @@ export class LevelHandler {
                 other.character.questTrackerState = progress;
             }
             other.send(0xB7, payload);
+            if (!indexed.has(other)) {
+                missedByIndex.push(other.character?.name ?? '?');
+            }
+        }
+
+        if (missedByIndex.length > 0) {
+            // Not fatal here any more, but it means anything else still reading the
+            // index for this scope (combat relay, cutscene fan-out, the fresh-run guard)
+            // is also missing these players.
+            console.warn(
+                `[DungeonProgress] level scope index is STALE for ${levelScope}: ` +
+                `${missedByIndex.join(', ')} were in the scope but absent from sessionsByLevelScope.`
+            );
         }
     }
 
@@ -3116,6 +3178,15 @@ export class LevelHandler {
                     Date.now() + LevelHandler.ROOM_TRANSITION_GRACE_MS
                 );
                 PetHandler.armMountTravelProtection(client, 4000, true);
+                // The grace above stops the server clamping the player back into the room
+                // they left, but it does not tell anyone else they moved. A room change is a
+                // single large jump, and the other clients are still drawing the body where
+                // it was: the player is shown standing in the old room, or at a position with
+                // no relation to where they are. Push the authoritative body now, and let the
+                // resync pass cover the case where they are still mid-teleport and there is
+                // no floor sample to place them on yet.
+                EntityHandler.refreshPlayerSnapshot(client);
+                EntityHandler.schedulePlayerVisibilityResync(client);
             }
             LevelHandler.maybeStartTutorialDungeonTraversalTutorial(client, roomId);
         }
@@ -4174,9 +4245,16 @@ export class LevelHandler {
             LevelHandler.markSharedDungeonCutsceneParticipant(client, resolvedRoomId, 0);
         }
 
+        // A player standing in the room whose participation was never registered is still
+        // watching the scene, and this line is their own client's, describing what their
+        // own screen is showing. Dropping it left them in a boss fight with no dialogue at
+        // all while the other player read the whole exchange. Each screen plays its own
+        // copy, so 'local' is the answer for anyone the scene is not being relayed to.
         if (!LevelHandler.isSharedDungeonCutsceneParticipant(client, levelScope, resolvedRoomId)) {
-            return 'suppress';
+            return 'local';
         }
+        // Still suppressed: a line the client attributed to *another player's* body. That
+        // is not this scene talking, and echoing it puts words over someone else's head.
         if (LevelHandler.isOtherPlayerRoomThoughtEntity(client, levelScope, entityId)) {
             return 'suppress';
         }
@@ -4199,14 +4277,13 @@ export class LevelHandler {
             0,
             Math.round(Number(client.activeDungeonCutsceneLocalDialogIndex ?? 0) || 0)
         );
-        const joinedAtDialogIndex = Math.max(
-            0,
-            Math.round(Number(client.activeDungeonCutsceneJoinedAtDialogIndex ?? 0) || 0)
-        );
         client.activeDungeonCutsceneLocalDialogIndex = localDialogIndex + 1;
-        if (localDialogIndex < joinedAtDialogIndex) {
-            return 'suppress';
-        }
+        // The catch-up skip that used to live here dropped a late joiner's first N lines,
+        // on the theory that they were replays of dialogue delivered before that player
+        // arrived. They are not replays: every line here is emitted by this client's own
+        // cutscene, in step with what it is drawing right now, so skipping them blanked out
+        // the start of the boss scene for whoever did not own it. Dialogue is per screen —
+        // each client shows its own, and neither is relayed to the other.
         return 'local';
     }
 

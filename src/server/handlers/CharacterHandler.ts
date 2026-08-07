@@ -1032,6 +1032,7 @@ export class CharacterHandler {
              let syncEntryLevel: string | undefined = storedDungeonSnapshot?.entryLevel;
              let syncQuestProgress: number | undefined = storedDungeonSnapshot?.questProgress;
 
+             let syncedWithPartyAnchor = false;
              if (isDungeonLevel) {
                  const normalizedTarget = LevelConfig.normalizeLevelName(currentLevelName);
                  // Search active sessions for a party member in the same dungeon
@@ -1079,12 +1080,24 @@ export class CharacterHandler {
                      syncQuestProgress = syncQuestProgress ?? (Number.isFinite(Number(other.character.questTrackerState))
                          ? Math.max(0, Math.min(100, Math.round(Number(other.character.questTrackerState))))
                          : undefined);
+                     syncedWithPartyAnchor = true;
                      console.log(`[EnterWorld] Syncing dungeon instance for ${char.name} with party anchor ${other.character.name} (instanceId=${levelInstanceId})`);
                      break;
                  }
 
                  if (!levelInstanceId) {
                      levelInstanceId = createDungeonInstanceId(token);
+                 } else if (!syncedWithPartyAnchor) {
+                     // No party mate was found in this dungeon, so the id came from this
+                     // character's own saved snapshot: they resume a PRIVATE run with their
+                     // own enemies. Reported repeatedly as "the second player spawns their
+                     // own enemies", and it is invisible unless the source is stated.
+                     const partyId = getPartyIdForClient(client);
+                     console.warn(
+                         `[EnterWorld] ${char.name} -> ${normalizedTarget} reusing stored snapshot ` +
+                         `instance '${levelInstanceId}' (no party mate found in this dungeon; ` +
+                         `partyId=${partyId || 0}). This is a private run unless the scope guard adopts one later.`
+                     );
                  }
              }
 

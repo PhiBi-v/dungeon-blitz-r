@@ -8,6 +8,7 @@ import { NpcDef } from '../data/NpcLoader';
 import { Client } from './Client';
 import { sharesRoomIds } from './PartySync';
 import { getClientLevelScope, getScopeLevelName } from './LevelScope';
+import { LevelConfig } from './LevelConfig';
 import { DungeonCompletionConditions } from './DungeonCompletionConditions';
 import { getRoomBossAwareRoomId, isRoomBossEntity } from './RoomBossState';
 import { EntityState } from './Entity';
@@ -40,8 +41,27 @@ export class AILogic {
     );
     static readonly BASE_NPC_DAMAGE = 15;
     static readonly ENABLE_SERVER_AUTHORITY_HOSTILE_AI = process.env.ENABLE_SERVER_AUTHORITY_HOSTILE_AI === '1';
+    // Server-authority levels whose hostiles are driven by this AI rather than by the
+    // client's local Brain on the proxy. The rest of SERVER_AUTHORITY_HOSTILE_LEVELS
+    // (JC_Mini1Hard, TutorialDungeon) still animate client-side, so this is opt-in per
+    // level instead of flipping ENABLE_SERVER_AUTHORITY_HOSTILE_AI for everyone.
+    private static readonly SERVER_AUTHORITY_AI_LEVELS = new Set<string>([
+        'JC_Mini2',
+        'JC_Mini2Hard'
+    ]);
     static readonly SLOW_TICK_MS = Math.max(25, Number(process.env.AI_SLOW_TICK_MS ?? 100));
     private static tickInProgress = false;
+
+    /**
+     * True when this level's server-authority hostiles should be moved/attacked by the
+     * server instead of by the client proxies. The env flag stays as the global override.
+     */
+    static runsServerAuthorityAI(levelName: string | null | undefined): boolean {
+        return AILogic.ENABLE_SERVER_AUTHORITY_HOSTILE_AI ||
+            AILogic.SERVER_AUTHORITY_AI_LEVELS.has(
+                LevelConfig.normalizeLevelName(getScopeLevelName(String(levelName ?? '')))
+            );
+    }
 
     private static hasCombatPull(npc: any): boolean {
         return Math.max(0, Math.round(Number(npc?.aggroTargetEntityId ?? 0))) > 0 ||
@@ -305,7 +325,7 @@ export class AILogic {
         let updatedNpcs = 0;
         for (const [entId, npc] of levelEntities.entries()) {
             if (npc.isPlayer || npc.team !== 2) continue; // Only Enemy NPCs
-            if (EntityHandler.usesServerAuthorityHostiles(levelName) && !AILogic.ENABLE_SERVER_AUTHORITY_HOSTILE_AI) continue; // JC_Mini1Hard uses client proxies for AI/animation.
+            if (EntityHandler.usesServerAuthorityHostiles(levelName) && !AILogic.runsServerAuthorityAI(levelName)) continue; // JC_Mini1Hard/TutorialDungeon still use client proxies for AI/animation.
             if (Boolean(npc.hybridCanonicalHostile) && !AILogic.ENABLE_SERVER_AUTHORITY_HOSTILE_AI) continue; // TODO: feature-flag server AI for promoted hybrid hostiles.
             if (npc.clientSpawned) continue; // Client-owned monsters should not receive server AI movement.
             // Simple dead check (if no hp prop, assume 100)

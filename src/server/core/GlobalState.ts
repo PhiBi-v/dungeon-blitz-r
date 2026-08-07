@@ -295,18 +295,90 @@ export class GlobalState {
     }
 
     static getSessionsInLevelScope(levelScope: string | null | undefined): ReadonlySet<Client> {
-        return GlobalState.sessionsByLevelScope.get(String(levelScope ?? '')) ?? GlobalState.EMPTY_SESSION_SET;
+        const scopeKey = String(levelScope ?? '');
+        const indexed = GlobalState.sessionsByLevelScope.get(scopeKey);
+        if (!indexed) {
+            return GlobalState.EMPTY_SESSION_SET;
+        }
+
+        // Almost everything a party shares -- seeing each other, boss health, boss death,
+        // cutscene fan-out, progress -- is fanned out over this set, so a session listed
+        // here whose real scope has moved on silently poisons all of it. The scope fields
+        // write through to the index now (see Client), which keeps the set complete; this
+        // catches anything that still mutates one of them behind the accessors.
+        let drifted: Client[] | null = null;
+        for (const session of indexed) {
+            if (getClientLevelScope(session) !== scopeKey) {
+                (drifted ??= []).push(session);
+            }
+        }
+        if (!drifted) {
+            return indexed;
+        }
+
+        for (const session of drifted) {
+            GlobalState.refreshSessionIndexes(session);
+        }
+        return GlobalState.sessionsByLevelScope.get(scopeKey) ?? GlobalState.EMPTY_SESSION_SET;
+    }
+
+    /**
+     * True when every online, indexable member of the party is present in `indexed`.
+     *
+     * Party membership is indexed lazily: a session only lands in `sessionsByPartyId`
+     * when something calls `refreshSessionIndexes` for it *after* `partyByMember` was
+     * written. `refreshSessionIndexesByCharacterName` silently no-ops when the name is
+     * not in `sessionsByCharacterName`, and `refreshSessionIndexes` silently returns
+     * when the session is not the indexed one for its token — so a single missed
+     * refresh leaves a member permanently absent from the set.
+     *
+     * Cost is bounded by the party roster (a handful of names), not by session count.
+     */
+    private static isPartyIndexComplete(partyId: number, indexed: ReadonlySet<Client>): boolean {
+        const group = GlobalState.partyGroups.get(partyId);
+        if (!group) {
+            return true;
+        }
+
+        for (const member of group.members) {
+            const characterKey = normalizeCharacterKey(member);
+            if (!characterKey) {
+                continue;
+            }
+
+            // Resolve through the self-healing lookup rather than the raw name map, so
+            // a member whose name index was never populated still counts.
+            const session = GlobalState.getActiveSessionByCharacterName(member);
+            // Offline members have no session, and a session that is not the indexed
+            // one for its token cannot be refreshed — neither counts as missing, or we
+            // would rebuild on every call.
+            if (!session || GlobalState.indexedSessionsByToken.get(session.token) !== session) {
+                continue;
+            }
+            if (!indexed.has(session)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     static getSessionsInParty(partyId: number | null | undefined): ReadonlySet<Client> {
         const normalizedPartyId = Math.max(0, Math.round(Number(partyId ?? 0)));
-        const indexed = GlobalState.sessionsByPartyId.get(normalizedPartyId);
-        if (indexed || normalizedPartyId <= 0) {
-            return indexed ?? GlobalState.EMPTY_SESSION_SET;
+        if (normalizedPartyId <= 0) {
+            return GlobalState.EMPTY_SESSION_SET;
         }
 
-        // Compatibility for tests and maintenance scripts that mutate the
-        // legacy party maps directly. Runtime party flows refresh eagerly.
+        const indexed = GlobalState.sessionsByPartyId.get(normalizedPartyId);
+        if (indexed && GlobalState.isPartyIndexComplete(normalizedPartyId, indexed)) {
+            return indexed;
+        }
+
+        // Self-heal: rebuild from the authoritative party maps. This also covers tests
+        // and maintenance scripts that mutate the legacy party maps directly.
+        // Previously this ran only when NO set existed, so the first member to be
+        // indexed froze an incomplete set in place — which silently split a party
+        // across two dungeon instances (each player getting their own enemies).
         for (const session of GlobalState.indexedSessionsByToken.values()) {
             const characterKey = normalizeCharacterKey(session.character?.name);
             if (Number(GlobalState.partyByMember.get(characterKey) ?? 0) === normalizedPartyId) {

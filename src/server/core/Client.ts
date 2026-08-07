@@ -178,17 +178,80 @@ export class Client {
     public challengeStr: string = "";
 
     // Entity State
-    public token: number = 0;
+    //
+    // token / currentLevel / levelInstanceId / currentRoomId are the four fields the
+    // session indexes are derived from, so they write through to those indexes instead of
+    // relying on every caller to remember `GlobalState.refreshSessionIndexes`. One missed
+    // refresh used to leave a live player out of `sessionsByLevelScope` for the rest of the
+    // run: the party member who walked through a door stopped being sent to anyone reading
+    // that index -- other players, combat relay, cutscene fan-out, progress broadcasts --
+    // while still seeing everyone else, because their own lookups used their own scope.
+    // Deriving the index on write makes that drift unrepresentable.
+    private _token: number = 0;
+    private _currentLevel: string = "";
+    private _levelInstanceId: string = "";
+    private _currentRoomId: number = -1;
+
+    private reindexSession(): void {
+        const { GlobalState } = require('./GlobalState') as typeof import('./GlobalState');
+        GlobalState.refreshSessionIndexes(this);
+    }
+
+    public get token(): number {
+        return this._token;
+    }
+
+    public set token(value: number) {
+        if (this._token === value) {
+            return;
+        }
+        this._token = value;
+        this.reindexSession();
+    }
+
+    public get currentLevel(): string {
+        return this._currentLevel;
+    }
+
+    public set currentLevel(value: string) {
+        if (this._currentLevel === value) {
+            return;
+        }
+        this._currentLevel = value;
+        this.reindexSession();
+    }
+
+    public get levelInstanceId(): string {
+        return this._levelInstanceId;
+    }
+
+    public set levelInstanceId(value: string) {
+        if (this._levelInstanceId === value) {
+            return;
+        }
+        this._levelInstanceId = value;
+        this.reindexSession();
+    }
+
+    public get currentRoomId(): number {
+        return this._currentRoomId;
+    }
+
+    public set currentRoomId(value: number) {
+        if (this._currentRoomId === value) {
+            return;
+        }
+        this._currentRoomId = value;
+        this.reindexSession();
+    }
+
     public clientEntID: number = 0;
     public entities: Map<number, any> = new Map();
-    public currentLevel: string = "";
     public craftTownHostCharacter: Character | null = null;
-    public levelInstanceId: string = "";
     public entryLevel: string = "";
     public entryX: number = 0;
     public entryY: number = 0;
     public entryHasCoord: boolean = false;
-    public currentRoomId: number = -1;
     public lastDoorId: number = -1;
     public lastDoorTargetLevel: string = "";
     public playerSpawned: boolean = false;

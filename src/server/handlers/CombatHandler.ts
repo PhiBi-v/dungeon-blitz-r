@@ -165,6 +165,8 @@ export class CombatHandler {
     private static readonly recentTutorialBossHitPackets = new Map<string, number>();
     private static readonly SERVER_AUTHORITY_SYNC_LEVELS = new Set<string>([
         'JC_Mini1Hard',
+        'JC_Mini2',
+        'JC_Mini2Hard',
         'TutorialDungeon'
     ]);
 
@@ -3478,8 +3480,23 @@ export class CombatHandler {
         previousEntState: number;
     } {
         const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
-        const canonicalVisible = EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(getClientLevelScope(viewer));
-        const localId = EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+        const viewerScope = getClientLevelScope(viewer);
+        const canonicalVisible = EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(viewerScope);
+        // `resolveEntityLocalId` falls back to the canonical id when the viewer has no
+        // alias, so every health correction for an unbound copy was addressed to an id that
+        // client has never heard of. The enemy took no damage and did not die on that screen
+        // until something else happened to rebind it -- one player's enemies dying instantly
+        // and the other player's dying late, or not at all. Resolve through the
+        // adoption-aware path first.
+        const resolved = EntityHandler.resolveHostileLocalIdForViewer(
+            viewer,
+            viewerScope,
+            canonicalId,
+            'hostile-viewer-cache'
+        );
+        const localId = resolved.ok && resolved.localId > 0
+            ? resolved.localId
+            : EntityHandler.resolveEntityLocalId(viewer, canonicalId);
         const targetId = localId > 0 ? localId : canonicalId;
         const existing = viewer.entities.get(targetId) ?? viewer.entities.get(canonicalId) ?? {};
         const previousHp = Math.round(Number(existing?.hp ?? NaN));
@@ -3543,7 +3560,7 @@ export class CombatHandler {
         }
 
         const canonicalHp = Math.max(0, Math.round(Number(entity?.hp ?? 0)));
-        const maxHp = Math.max(1, Math.round(Number(entity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(entity) || 1);
+        const maxHp = Math.max(1, Math.round(Number(entity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(entity, levelScope) || 1);
         const existing = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
         const previousHpRaw = Number(existing?.hp ?? NaN);
         const previousHp = Number.isFinite(previousHpRaw)
@@ -3638,7 +3655,7 @@ export class CombatHandler {
             return false;
         }
 
-        const maxHp = Math.max(1, Math.round(Number(canonicalEntity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(canonicalEntity) || 1);
+        const maxHp = Math.max(1, Math.round(Number(canonicalEntity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(canonicalEntity, levelScope) || 1);
         const existing = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
         const previousHpRaw = Number(existing?.hp ?? NaN);
         const previousHp = Number.isFinite(previousHpRaw)
@@ -3901,12 +3918,12 @@ export class CombatHandler {
 
         EntityHandler.normalizeServerAuthorityHostileState(levelScope, entity);
         const entityId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
-        const maxHp = Math.max(1, Math.round(Number(entity.maxHp ?? EntityHandler.estimateServerAuthorityHostileMaxHp(entity))));
+        const maxHp = Math.max(1, Math.round(Number(entity.maxHp ?? EntityHandler.estimateServerAuthorityHostileMaxHp(entity, levelScope))));
         CombatHandler.finalizeHostileDeath(anchor, levelScope, entityId, entity, {
             includeAnchor: true,
             reason: 'server_authority_hostile_death'
         });
-        entity.level = EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL;
+        entity.level = EntityHandler.resolveServerAuthorityEntityLevel(levelScope);
         entity.maxHp = maxHp;
         entity.hp = 0;
         entity.dead = true;
@@ -3941,7 +3958,24 @@ export class CombatHandler {
                 continue;
             }
 
-            const localEntityId = EntityHandler.resolveEntityLocalId(viewer, entityId);
+            // The viewer's own id for the shared entity, not the canonical one.
+            // `resolveEntityLocalId` falls back to the canonical id when the viewer has no
+            // alias, so the destroy went out addressed to an id that viewer's client has
+            // never heard of -- a silent no-op, and the boss stayed standing there at full
+            // health on the screen of everyone who did not land the killing blow. The
+            // resolver below also adopts an unbound local copy rather than giving up.
+            const resolved = EntityHandler.resolveHostileLocalIdForViewer(
+                viewer,
+                levelScope,
+                entityId,
+                'server-authority-destroy'
+            );
+            const localEntityId = resolved.ok && resolved.localId > 0
+                ? resolved.localId
+                : EntityHandler.getRegisteredHostileLocalIdForViewer(viewer, destroyedEntity);
+            if (localEntityId <= 0) {
+                continue;
+            }
             viewer.send(0x0D, CombatHandler.buildDestroyEntityPayload(localEntityId, immediate));
             viewer.entities.delete(localEntityId);
             viewer.entities.delete(entityId);

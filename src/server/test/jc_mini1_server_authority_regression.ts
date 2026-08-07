@@ -282,11 +282,20 @@ function attachProxy(client: FakeClient, localId: number, name: string, x: numbe
 
 function assertSevenCanonicalHostiles(scope: string): void {
     const hostiles = getHostiles(scope);
+    // Dread JC_Mini1Hard is authored at tier 44 (mapId 44 over baseId 29), so that is the
+    // tier every party member gets -- not the flat 50 this used to be pinned to.
+    const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel('JC_Mini1Hard');
+    assert.equal(authoredLevel, 44, 'JC_Mini1Hard is authored at Dread tier 44');
     assert.equal(hostiles.length, 7, 'JC_Mini1Hard should seed exactly seven canonical hostiles');
     for (const hostile of hostiles) {
         assert.equal(hostile.clientSpawned, false, `${hostile.name} should be server canonical`);
-        assert.equal(hostile.level, 50, `${hostile.name} should be level 50`);
-        assert.ok(Number(hostile.maxHp ?? 0) > 100, `${hostile.name} should have level-50 maxHp`);
+        assert.equal(hostile.level, authoredLevel, `${hostile.name} should carry the dungeon's own tier`);
+        assert.equal(
+            Number(hostile.maxHp ?? 0),
+            EntityHandler.estimateServerAuthorityHostileMaxHp(hostile, 'JC_Mini1Hard'),
+            `${hostile.name} should be sized from the dungeon tier`
+        );
+        assert.ok(Number(hostile.maxHp ?? 0) > 0, `${hostile.name} should have a health pool`);
         assert.equal(hostile.hp, hostile.maxHp, `${hostile.name} should start at full canonical HP`);
     }
     const boss = GlobalState.levelEntities.get(scope)?.get(910005);
@@ -384,12 +393,15 @@ async function testProxyAttachHitDeathAndDestroy(): Promise<void> {
     assert.equal(EntityHandler.resolveEntityAlias(telahair as never, 600001), 910001, 'joiner local proxy should map to same canonical ImperialMagus');
     assert.equal(GlobalState.levelEntities.get(scope)?.has(500001), false, 'local proxy must not enter canonical level map');
     assert.equal(zeus.sentPackets.some((packet) => packet.id === 0x0D), false, 'seed proxy attach should not destroy local actor');
-    assert.equal(zeus.entities.get(500001)?.level, 50, 'starter proxy cache should be forced to level 50');
-    assert.equal(telahair.entities.get(600001)?.level, 50, 'joiner proxy cache should be forced to level 50');
+    // Both proxies carry the dungeon's own tier, so the two players are looking at the same
+    // enemy at the same difficulty rather than at whatever their own level implies.
+    const proxyLevel = LevelConfig.getAuthoredDungeonEnemyLevel('JC_Mini1Hard');
+    assert.equal(zeus.entities.get(500001)?.level, proxyLevel, 'starter proxy cache should carry the dungeon tier');
+    assert.equal(telahair.entities.get(600001)?.level, proxyLevel, 'joiner proxy cache should carry the same dungeon tier');
     const attachCanonical = GlobalState.levelEntities.get(scope)?.get(910001);
     assert.ok(attachCanonical, 'canonical target should exist after proxy attach');
-    assert.equal(zeus.entities.get(500001)?.maxHp, attachCanonical.maxHp, 'starter proxy cache maxHp should match canonical level-50 maxHp');
-    assert.equal(telahair.entities.get(600001)?.maxHp, attachCanonical.maxHp, 'joiner proxy cache maxHp should match canonical level-50 maxHp');
+    assert.equal(zeus.entities.get(500001)?.maxHp, attachCanonical.maxHp, 'starter proxy cache maxHp should match the canonical pool');
+    assert.equal(telahair.entities.get(600001)?.maxHp, attachCanonical.maxHp, 'joiner proxy cache maxHp should match the canonical pool');
     assert.equal(
         zeus.sentPackets.some((packet) => packet.id === 0x78 && parseHpDelta(packet.payload).entityId === 500001 && parseHpDelta(packet.payload).delta > 0),
         true,

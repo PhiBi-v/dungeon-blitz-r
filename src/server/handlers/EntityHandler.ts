@@ -20,7 +20,13 @@ import { clearOpenBossScene, getOpenBossScene, isRoomBossEntity, markRoomBossEnt
 import { getBossIdentityKey, getBossIdentityKeys } from '../core/BossCopyCensus';
 import { TutorialDungeonAuthorityEntity, TutorialDungeonMechanics } from '../core/TutorialDungeonMechanics';
 import { MovementAuthority } from '../core/MovementAuthority';
-import { discardForeignGroundedSample, inheritGroundedSample, noteGroundedSample } from '../core/GroundedPosition';
+import {
+    discardForeignGroundedSample,
+    inheritGroundedSample,
+    isEntityAirborne,
+    noteGroundedSample,
+    resolveConfirmedGroundedPosition
+} from '../core/GroundedPosition';
 import {
     buildHomeStatueEntity,
     HOME_STATUE_LEVEL,
@@ -62,6 +68,9 @@ export class EntityHandler {
     ]);
     private static readonly MOUNT_SYNC_RETRY_DELAYS_MS = [0, 300, 1200, 2500, 4000];
     private static readonly CLIENT_SPAWN_JOINER_SEED_DELAYS_MS = [2500, 4500];
+    // Short, because an unseen party member is unplayable, and twice, because the two halves
+    // of a door transfer can complete in either order.
+    private static readonly PLAYER_VISIBILITY_RESYNC_DELAYS_MS = [1200, 3000];
     private static readonly GOBLIN_RIVER_ROOM_SYNC_SKIP_LEVELS = new Set<string>([
         'TutorialDungeon',
         'GoblinRiverDungeon',
@@ -70,9 +79,39 @@ export class EntityHandler {
     private static readonly SERVER_AUTHORITY_HOSTILE_LEVELS = new Set<string>([
         'JC_Mini1Hard',
         'JC_Mini2',
+        'JC_Mini2Hard',
         'TutorialDungeon'
     ]);
-    private static readonly FIRST_SIGHT_SERVER_AUTHORITY_HOSTILE_LEVELS = new Set<string>();
+    // Levels where the SERVER draws the enemies: it sends every live canonical hostile
+    // itself, and the client is expected not to spawn its own room cues. This is what
+    // stops a joiner from seeing enemies the party already killed — the client can no
+    // longer invent them locally.
+    //
+    // OFF by default: LevelsJC.swf is unpatched, so the Flash client still draws the East
+    // Wing enemies from its own room cues. Turning this on without matching client-side
+    // cue suppression draws every live enemy TWICE — once by the client, once by the
+    // server — because `bridgeCanonicalVisibleServerAuthorityProxy` deliberately keeps the
+    // client's local copy alive (it only destroys proxies whose canonical is dead).
+    //
+    // A cue-suppression patch was tried and reverted on 2026-07-24: adding
+    // `EastWingSuppressClientCues()` to the four a_Room_JCMini2_0N classes (bHoldSpawn +
+    // bDoNotAutoSpawn + removeChild, from both the constructor and frame 1) suppressed only
+    // ~16 of the 34 cues. It is positional, not type-based — the same enemy type was
+    // suppressed at one placement and spawned at another — so the display-list walk is
+    // reaching the room's children too late or too narrowly. Solve that before re-enabling.
+    private static readonly ENABLE_EAST_WING_SERVER_DRAWN_ENEMIES =
+        process.env.EAST_WING_SERVER_DRAWN_ENEMIES === '1';
+    private static readonly FIRST_SIGHT_SERVER_AUTHORITY_HOSTILE_LEVELS =
+        EntityHandler.ENABLE_EAST_WING_SERVER_DRAWN_ENEMIES
+            ? new Set<string>(['JC_Mini2', 'JC_Mini2Hard'])
+            : new Set<string>();
+    // Levels where the canonical spawn table is the ONLY source of hostiles. A
+    // client-spawned enemy that matches nothing in it is rejected instead of being
+    // registered, so it cannot become a per-client entity that only its owner sees.
+    private static readonly STRICT_CANONICAL_HOSTILE_LEVELS = new Set<string>([
+        'JC_Mini2',
+        'JC_Mini2Hard'
+    ]);
     private static readonly CANONICAL_VISIBLE_PROXY_MATCH_MAX_DISTANCE_SQ = 400 * 400;
     static readonly SERVER_AUTHORITY_ENTITY_LEVEL = 50;
     private static readonly HOSTILE_BASE_HITPOINTS = [
@@ -119,6 +158,19 @@ export class EntityHandler {
 
     static usesServerAuthorityHostiles(levelName: string | null | undefined): boolean {
         return EntityHandler.SERVER_AUTHORITY_HOSTILE_LEVELS.has(LevelConfig.normalizeLevelName(levelName));
+    }
+
+    /**
+     * True when a client-spawned hostile that matches no canonical entity must be
+     * destroyed rather than accepted. Without this, anything the client invents —
+     * an entity carried over from a previous level, a client-side summon, a proxy
+     * that drifted out of match range — is registered as a `clientSpawned` hostile
+     * owned by that one session, so each player ends up fighting their own copies.
+     */
+    static rejectsUnmatchedClientHostiles(levelName: string | null | undefined): boolean {
+        return EntityHandler.STRICT_CANONICAL_HOSTILE_LEVELS.has(
+            LevelConfig.normalizeLevelName(getScopeLevelName(String(levelName ?? '')))
+        );
     }
 
     static usesCanonicalVisibleServerAuthorityHostiles(levelName: string | null | undefined): boolean {
@@ -292,10 +344,31 @@ export class EntityHandler {
         return EntityHandler.HOSTILE_BASE_HITPOINTS[clampedLevel];
     }
 
-    static estimateServerAuthorityHostileMaxHp(entity: any): number {
+    /**
+     * The tier a server-authority hostile is sized and stamped at.
+     *
+     * The dungeon's own authored tier, so The East Wing's enemies are level 29 rather than
+     * the flat 50 this used to pin every server-authority level to. It is a property of
+     * the level, so every party member gets the same one -- see
+     * `LevelConfig.getAuthoredDungeonEnemyLevel`. The old constant survives only as the
+     * fallback for a scope whose level cannot be resolved (an entity looked up by name
+     * alone, mid-transfer state), where sizing a hostile down would be worse than leaving
+     * it where it was.
+     */
+    static resolveServerAuthorityEntityLevel(levelNameOrScope: string | null | undefined): number {
+        const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel(
+            getScopeLevelName(String(levelNameOrScope ?? ''))
+        );
+        return authoredLevel > 0 ? authoredLevel : EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL;
+    }
+
+    static estimateServerAuthorityHostileMaxHp(entity: any, levelNameOrScope?: string | null): number {
         const entType = GameData.getEntType(String(entity?.name ?? '')) ?? {};
         const hitPointScale = Number(entity?.HitPoints ?? entity?.hitPoints ?? entType?.HitPoints ?? NaN);
-        const baseHp = EntityHandler.getHostileBaseHpForLevel(EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL);
+        const entityLevel = EntityHandler.resolveServerAuthorityEntityLevel(
+            levelNameOrScope ?? entity?.levelScope ?? entity?.levelName
+        );
+        const baseHp = EntityHandler.getHostileBaseHpForLevel(entityLevel);
         if (!Number.isFinite(hitPointScale) || hitPointScale <= 0) {
             return Math.max(1, baseHp);
         }
@@ -319,7 +392,7 @@ export class EntityHandler {
         const oldMaxHp = Math.max(0, Math.round(Number(entity.maxHp ?? 0)));
         const oldHp = Math.max(0, Math.round(Number(entity.hp ?? (oldMaxHp || 0))));
         const oldDamage = oldMaxHp > 0 ? Math.max(0, oldMaxHp - oldHp) : 0;
-        const maxHp = EntityHandler.estimateServerAuthorityHostileMaxHp(entity);
+        const maxHp = EntityHandler.estimateServerAuthorityHostileMaxHp(entity, levelNameOrScope);
         const dead = Boolean(entity.dead) ||
             Boolean(entity.destroyed) ||
             Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
@@ -327,7 +400,7 @@ export class EntityHandler {
         const hp = dead ? 0 : Math.max(1, Math.min(maxHp, maxHp - oldDamage));
         const healthDelta = hp - maxHp;
 
-        entity.level = EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL;
+        entity.level = EntityHandler.resolveServerAuthorityEntityLevel(levelNameOrScope);
         entity.maxHp = maxHp;
         entity.hp = hp;
         entity.healthDelta = healthDelta;
@@ -404,8 +477,15 @@ export class EntityHandler {
         EntityHandler.serverAuthoritySeededScopes.add(levelScope);
     }
 
+    /**
+     * Guards the destructive fresh-run resets, so it must never rely on
+     * `sessionsByLevelScope`: that index is refreshed lazily and has been observed
+     * dropping a live player mid-run. A false negative here wipes a run that someone is
+     * still playing and respawns every enemy, so this scans live sessions instead. It
+     * only runs on level entry, not per frame.
+     */
     private static hasOtherActiveSessionInScope(client: Client, levelScope: string): boolean {
-        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
+        for (const session of GlobalState.sessionsByToken.values()) {
             if (
                 session !== client &&
                 session.playerSpawned &&
@@ -491,11 +571,47 @@ export class EntityHandler {
         }
 
         if (moved > 0) {
+            console.log(
+                `[PartyScope] moved ${moved} owned entities for ${client.character?.name ?? '?'} ` +
+                `${oldScope} -> ${newScope}`
+            );
         }
     }
 
     private static emitJcMini1PartyScopeSnapshot(client: Client, levelName: string, reason: string): void {
-        if (!EntityHandler.usesServerAuthorityHostiles(levelName) || getPartyIdForClient(client) <= 0) {
+        if (!EntityHandler.usesServerAuthorityHostiles(levelName)) {
+            return;
+        }
+
+        // A player with no server-side party can never adopt anyone's dungeon instance,
+        // so they always open a private run with their own enemies. That is correct
+        // behaviour, but it is indistinguishable from a bug at the client, so say it out
+        // loud whenever somebody else is already standing in this dungeon. Reported as
+        // "the second player spawns their own enemies" more than once — and because every
+        // other diagnostic here is gated on being in a party, this case used to log
+        // nothing at all.
+        if (getPartyIdForClient(client) <= 0) {
+            const selfScope = getClientLevelScope(client);
+            const others: string[] = [];
+            for (const session of GlobalState.sessionsByToken.values()) {
+                if (
+                    session === client ||
+                    !session.character ||
+                    !session.playerSpawned ||
+                    LevelConfig.normalizeLevelName(session.currentLevel) !== levelName
+                ) {
+                    continue;
+                }
+                others.push(`${session.character.name}@${getClientLevelScope(session)}`);
+            }
+            if (others.length > 0) {
+                console.warn(
+                    `[PartyScope][NO-PARTY] ${client.character?.name ?? '?'} reason=${reason} entered ${levelName} ` +
+                    `on ${selfScope} with NO server-side party, while already inside: ${others.join(', ')}. ` +
+                    'Without a party there is no anchor to adopt, so this player gets a private run ' +
+                    'with its own enemies. Check that the party invite was actually accepted.'
+                );
+            }
             return;
         }
 
@@ -519,6 +635,69 @@ export class EntityHandler {
                     .filter((entity: any) => Number(entity?.team ?? 0) === EntityTeam.ENEMY && Number(entity?.canonicalEntityId ?? 0) > 0)
                     .length
             });
+        }
+
+        // This snapshot used to be collected and then thrown away, which is why a party
+        // silently splitting across two dungeon instances left no trace at all. Always
+        // report the anomaly — a party mate standing in the same level on a *different*
+        // instance id means each of them gets their own copy of every enemy. Set
+        // DUNGEON_SCOPE_DIAG=1 for the full per-entry dump.
+        const selfScope = getClientLevelScope(client);
+        const splitMembers = partyMembers.filter(
+            (member) =>
+                member.token !== client.token &&
+                LevelConfig.normalizeLevelName(member.level) === levelName &&
+                member.scope !== selfScope
+        );
+        if (splitMembers.length > 0) {
+            console.warn(
+                `[PartyScope][SPLIT] ${client.character?.name ?? '?'} reason=${reason} level=${levelName} ` +
+                `scope=${selfScope} is separate from ${splitMembers.length} party mate(s) in the same level: ` +
+                splitMembers.map((member) => `${member.name}@${member.scope}`).join(', ') +
+                ' — each side will spawn its own enemies.'
+            );
+        }
+        if (process.env.DUNGEON_SCOPE_DIAG === '1') {
+            console.log(
+                `[PartyScope] ${client.character?.name ?? '?'} reason=${reason} level=${levelName} ` +
+                `scope=${selfScope} members=${JSON.stringify(partyMembers)}`
+            );
+        }
+    }
+
+    /**
+     * Give a joiner the party's room progress instead of a blank slate.
+     *
+     * `handleEnterWorld` clears `startedRoomEvents`, and `shouldSkipDungeonRoomProgressSync`
+     * is true for every shared-progress dungeon (JC_Mini2 included), so a joiner used to
+     * arrive believing no room had ever been started. The server then treated their run as
+     * fresh: their own saved DungeonSnapshot recorded zero started rooms, and anything
+     * keyed on `getStartedRoomIdsForLevel` disagreed with the rest of the party.
+     *
+     * Only the server-side set is merged — deliberately no 0xA5 replay to the client. The
+     * comment in CharacterHandler's anchor block records that replaying room-event starts
+     * makes the Flash client throw before its level SWF has loaded.
+     */
+    private static adoptPartyRoomProgress(client: Client, anchor: Client, levelName: string): void {
+        const normalizedLevel = LevelConfig.normalizeLevelName(levelName) || levelName;
+        if (!normalizedLevel || !anchor?.startedRoomEvents || !client?.startedRoomEvents) {
+            return;
+        }
+
+        const prefix = `${normalizedLevel}:`;
+        const adopted: string[] = [];
+        for (const key of anchor.startedRoomEvents) {
+            if (key.startsWith(prefix) && !client.startedRoomEvents.has(key)) {
+                client.startedRoomEvents.add(key);
+                adopted.push(key.substring(prefix.length));
+            }
+        }
+
+        if (adopted.length > 0) {
+            console.log(
+                `[PartyScope] ${client.character?.name ?? '?'} adopted room progress from ` +
+                `${anchor.character?.name ?? '?'} in ${normalizedLevel}: rooms ${adopted.join(', ')}`
+            );
         }
     }
 
@@ -547,11 +726,29 @@ export class EntityHandler {
             GlobalState.refreshSessionIndexes(anchor);
         }
 
+        if (anchor) {
+            EntityHandler.adoptPartyRoomProgress(client, anchor, levelName);
+        }
+
         const newScope = getLevelScopeKey(levelName, targetInstanceId);
         if (oldScope !== newScope || oldInstanceId !== targetInstanceId) {
+            console.log(
+                `[PartyScope] ${client.character?.name ?? '?'} reason=${reason} adopting ` +
+                `${anchor ? `anchor ${anchor.character?.name ?? '?'}` : 'own'} instance: ${oldScope} -> ${newScope}`
+            );
             client.levelInstanceId = targetInstanceId;
             EntityHandler.moveClientOwnedEntitiesBetweenScopes(client, oldScope, newScope);
             GlobalState.refreshSessionIndexes(client);
+        } else if (reason === 'send_initial_level_entities') {
+            // The "scope was already correct" outcome used to be completely silent, which
+            // made it impossible to tell a working share from a failed one. Report the
+            // resolved scope on every dungeon entry instead.
+            const partyId = getPartyIdForClient(client);
+            console.log(
+                `[PartyScope] ${client.character?.name ?? '?'} reason=${reason} kept ${newScope} ` +
+                `(partyId=${partyId || 0}, partySessions=${partyId > 0 ? GlobalState.getSessionsInParty(partyId).size : 0}, ` +
+                `anchor=${anchor ? (anchor.character?.name ?? '?') : 'none'})`
+            );
         }
 
         EntityHandler.emitJcMini1PartyScopeSnapshot(client, levelName, reason);
@@ -576,10 +773,34 @@ export class EntityHandler {
         return normalized.endsWith('hard') ? normalized.slice(0, -4) : normalized;
     }
 
+    /**
+     * Which canonical hostiles this client has already bound a proxy to.
+     *
+     * Without this the matcher hands the same canonical to two different proxies: the East
+     * Wing has clusters of identical enemies (two BoneFiends ~190px apart in room 1), and
+     * both of their proxies resolved to canonical 920009 while 920008 was left unclaimed.
+     * A mis-bound proxy inherits the wrong entity's life state, which is how a dead enemy
+     * ends up reported as alive — and therefore never destroyed on the joiner's screen.
+     */
+    private static getClaimedCanonicalIds(client: Client | null | undefined): Set<number> {
+        const claimed = new Set<number>();
+        if (!client?.entityIdAliases) {
+            return claimed;
+        }
+        for (const canonicalId of client.entityIdAliases.values()) {
+            const id = Math.max(0, Math.round(Number(canonicalId) || 0));
+            if (id > 0) {
+                claimed.add(id);
+            }
+        }
+        return claimed;
+    }
+
     private static findServerAuthorityProxyCanonical(
         levelName: string | null | undefined,
         levelMap: Map<number, any> | null,
-        entity: any
+        entity: any,
+        client: Client | null = null
     ): any | null {
         if (!EntityHandler.usesServerAuthorityHostiles(levelName) || !levelMap || !entity || entity.isPlayer) {
             return null;
@@ -598,13 +819,35 @@ export class EntityHandler {
         const proxyY = Number(entity.y ?? NaN);
         const hasProxyPosition = Number.isFinite(proxyX) && Number.isFinite(proxyY);
 
-        const requireClosePosition = EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelName) && hasProxyPosition;
+        // Closed-roster levels must also honour the distance cap. Previously it applied only
+        // in canonical-visible mode, so with that off a proxy could bind to a same-named
+        // enemy anywhere in the level — across rooms, not merely a few hundred pixels away.
+        const strictRoster = EntityHandler.rejectsUnmatchedClientHostiles(levelName);
+        const requireClosePosition =
+            (EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelName) || strictRoster) &&
+            hasProxyPosition;
+        const claimedCanonicalIds = strictRoster
+            ? EntityHandler.getClaimedCanonicalIds(client)
+            : null;
+        const proxyLocalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const alreadyBoundCanonicalId = proxyLocalId > 0
+            ? Math.max(0, Math.round(Number(client?.entityIdAliases?.get(proxyLocalId) ?? 0)))
+            : 0;
+
         for (const candidate of levelMap.values()) {
             if (!EntityHandler.isServerAuthorityHostileEntity(levelName, candidate)) {
                 continue;
             }
             if (EntityHandler.normalizeServerAuthorityProxyName(candidate.name) !== proxyName) {
                 continue;
+            }
+            if (claimedCanonicalIds) {
+                const candidateId = Math.max(0, Math.round(Number(candidate.id ?? 0)));
+                // One canonical per proxy. Re-binding the proxy that already owns it is
+                // fine; a second proxy stealing it is what produced the 920009/920009 pair.
+                if (candidateId > 0 && candidateId !== alreadyBoundCanonicalId && claimedCanonicalIds.has(candidateId)) {
+                    continue;
+                }
             }
 
             const candidateX = Number(candidate.x ?? NaN);
@@ -957,7 +1200,7 @@ export class EntityHandler {
         const maxHp = Math.max(
             1,
             Math.round(Number(entity?.maxHp ?? 0)) ||
-                EntityHandler.estimateServerAuthorityHostileMaxHp(entity) ||
+                EntityHandler.estimateServerAuthorityHostileMaxHp(entity, scope) ||
                 1
         );
         client.entities.set(localId, {
@@ -1027,10 +1270,38 @@ export class EntityHandler {
             return true;
         }
 
-        const existingCanonical = EntityHandler.findServerAuthorityProxyCanonical(levelName, levelMap, entity);
+        const existingCanonical = EntityHandler.findServerAuthorityProxyCanonical(levelName, levelMap, entity, client);
+        // First-sight promotion turns whatever a client reports into a canonical entity for
+        // everyone. That is the opposite of a closed roster, so it must stay off wherever
+        // the spawn table is the only source of truth — otherwise a client-invented enemy
+        // becomes real for the whole party. The two behaviours used to share one flag.
         const canonical = existingCanonical ??
-            EntityHandler.promoteFirstSightServerAuthorityHostile(client, levelName, levelMap, entity, rawEntityId);
+            (EntityHandler.rejectsUnmatchedClientHostiles(levelName)
+                ? null
+                : EntityHandler.promoteFirstSightServerAuthorityHostile(client, levelName, levelMap, entity, rawEntityId));
         if (!canonical) {
+            const strayName = EntityHandler.normalizeServerAuthorityProxyName(entity.name ?? entity.EntName) || '';
+            // Chests, dummies and other interactables arrive on the hostile team but are
+            // not enemies. Rejecting those would strip the player's loot, so only real
+            // hostiles are dropped here.
+            const isInteractable = /chest|treasure|dummy|target|objective|helper|parrot/i.test(strayName);
+            if (EntityHandler.rejectsUnmatchedClientHostiles(levelName) && !isInteractable) {
+                const strayLocalId = Math.max(0, Math.round(Number(rawEntityId || entity.id) || 0));
+                // Position is the tell: East Wing lives around x 11900-16200 / y 3200-6600.
+                // Anything at 0,0 or far outside that box is a phantom the client invented
+                // rather than something it is really rendering inside this dungeon.
+                console.warn(
+                    `[ServerAuthority] rejected unmatched client hostile ${strayName || '?'} ` +
+                    `id=${strayLocalId} room=${entity.roomId ?? '?'} ` +
+                    `pos=${Math.round(Number(entity.x ?? 0))},${Math.round(Number(entity.y ?? 0))} ` +
+                    `entState=${entity.entState ?? '?'} team=${entity.team ?? '?'} in ${levelName} ` +
+                    `for ${client.character?.name ?? '?'} — not in the canonical spawn table.`
+                );
+                if (strayLocalId > 0) {
+                    EntityHandler.destroyClientLocalEntity(client, strayLocalId, 'unmatched_client_hostile', entity);
+                }
+                return true;
+            }
             return false;
         }
 
@@ -1052,6 +1323,34 @@ export class EntityHandler {
         }
 
         const isDead = Boolean(canonical.dead) || Number(canonical.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
+
+        // A player joining a run must never see enemies the party already killed.
+        // The fingerprint/tombstone paths above cannot catch this on their own: they key
+        // on `name:roomId:x/100:y/100`, but client proxies arrive with roomId 0 and a Y
+        // that has settled onto the floor (up to ~70px below the authored value), so they
+        // miss. The proximity matcher that produced `canonical` is the one that reliably
+        // works, so trust it — if the canonical entity is dead, drop the local proxy
+        // outright instead of registering it as a dead proxy and hoping the client hides
+        // it. Gated to levels where the server roster is the only source of truth.
+        if (isDead && EntityHandler.rejectsUnmatchedClientHostiles(levelName)) {
+            if (localId !== canonicalId) {
+                EntityHandler.rememberEntityAlias(client, localId, canonicalId);
+            }
+            EntityHandler.destroyDeadServerAuthorityLocalProxy(client, entity, localId);
+            console.log(
+                `[ServerAuthority] proxy ${EntityHandler.normalizeServerAuthorityProxyName(entity.name) || '?'} ` +
+                `local=${localId} -> canonical=${canonicalId} DEAD -> destroyed for ${client.character?.name ?? '?'}`
+            );
+            return true;
+        }
+        if (EntityHandler.rejectsUnmatchedClientHostiles(levelName)) {
+            console.log(
+                `[ServerAuthority] proxy ${EntityHandler.normalizeServerAuthorityProxyName(entity.name) || '?'} ` +
+                `local=${localId} -> canonical=${canonicalId} alive(hp=${Math.round(Number(canonical.hp ?? 0))}) ` +
+                `for ${client.character?.name ?? '?'}`
+            );
+        }
+
         EntityHandler.ensureServerAuthorityProxyOwner(client, canonical, localId);
         EntityHandler.registerCanonicalHostileAlias(
             client,
@@ -1070,7 +1369,7 @@ export class EntityHandler {
             const proxyEntity = {
                 ...entity,
                 id: localId,
-                level: EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL,
+                level: EntityHandler.resolveServerAuthorityEntityLevel(levelName),
                 hp: Math.max(0, Math.round(Number(canonical.hp ?? 0))),
                 maxHp: Math.max(0, Math.round(Number(canonical.maxHp ?? 0))),
                 healthDelta: Math.round(Number(canonical.healthDelta ?? 0)),
@@ -1230,7 +1529,7 @@ export class EntityHandler {
         const bridgedEntity = {
             ...localEntity,
             id: localId,
-            level: EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL,
+            level: EntityHandler.resolveServerAuthorityEntityLevel(levelName),
             hp,
             maxHp,
             healthDelta,
@@ -1764,7 +2063,112 @@ export class EntityHandler {
             EntityHandler.registerCanonicalHostileAlias(viewer, levelScope, canonical, entityId, 'owner_canonical_visible');
             return { ok: true, localId: entityId, entity: canonical, reason: 'owner_canonical_visible' };
         }
+
+        const adoptedLocalId = EntityHandler.adoptViewerLocalHostileCopy(viewer, levelScope, canonical, entityId);
+        if (adoptedLocalId > 0) {
+            EntityHandler.registerCanonicalHostileAlias(viewer, levelScope, canonical, adoptedLocalId, 'viewer_local_copy_adopted');
+            return { ok: true, localId: adoptedLocalId, entity: canonical, reason: 'viewer_local_copy_adopted' };
+        }
+
         return { ok: false, localId: 0, entity: canonical, reason: 'missing_viewer_local_id' };
+    }
+
+    /**
+     * Last resort before a hostile update is dropped for one viewer.
+     *
+     * Every health, state and death relay resolves the viewer's own id for the shared
+     * entity and silently skips the viewer when there is none. That is the whole of the
+     * reported boss desync: both players are looking at the same boss, both are drawing
+     * their own copy of it, but only the one whose copy the server had bound saw the bar
+     * move — and when the boss died, only that copy died. The other player kept swinging
+     * at a full-health boss the server had already written off.
+     *
+     * A binding is missing whenever the attach path did not run for that viewer, or ran
+     * before the canonical existed. The copy is still sitting in the viewer's entity map,
+     * so match it the same way the attach path does — same enemy, close enough to be the
+     * same placement — and bind it rather than dropping the packet.
+     *
+     * Deliberately conservative: a local copy already bound to a different canonical is
+     * never stolen, a canonical already bound to a different local copy is never
+     * double-bound (the 920009/920009 pair), and the distance cap keeps a same-named
+     * enemy in another room out.
+     */
+    private static adoptViewerLocalHostileCopy(
+        viewer: Client,
+        levelScope: string,
+        canonical: any,
+        canonicalId: number
+    ): number {
+        if (!viewer?.entities?.size || !canonical || canonicalId <= 0) {
+            return 0;
+        }
+
+        const canonicalName = EntityHandler.normalizeServerAuthorityProxyName(canonical.name ?? canonical.EntName);
+        if (!canonicalName) {
+            return 0;
+        }
+
+        const claimedCanonicalIds = EntityHandler.getClaimedCanonicalIds(viewer);
+        if (claimedCanonicalIds.has(canonicalId)) {
+            return 0;
+        }
+
+        const canonicalX = Number(canonical.x ?? NaN);
+        const canonicalY = Number(canonical.y ?? NaN);
+        const hasCanonicalPosition = Number.isFinite(canonicalX) && Number.isFinite(canonicalY);
+
+        let bestLocalId = 0;
+        let bestDistanceSq = Number.POSITIVE_INFINITY;
+        for (const [localId, local] of viewer.entities.entries()) {
+            if (
+                localId <= 0 ||
+                localId === canonicalId ||
+                !local ||
+                local.isPlayer ||
+                Number(local.team ?? 0) !== EntityTeam.ENEMY ||
+                EntityHandler.isEntityDead(local)
+            ) {
+                continue;
+            }
+            if (EntityHandler.normalizeServerAuthorityProxyName(local.name ?? local.EntName) !== canonicalName) {
+                continue;
+            }
+
+            const boundCanonicalId = Math.max(0, Math.round(Number(viewer.entityIdAliases?.get(localId) ?? 0)));
+            if (boundCanonicalId > 0 && boundCanonicalId !== canonicalId) {
+                continue;
+            }
+
+            const localX = Number(local.x ?? NaN);
+            const localY = Number(local.y ?? NaN);
+            if (!hasCanonicalPosition || !Number.isFinite(localX) || !Number.isFinite(localY)) {
+                // No position to compare on either side: accept it only when nothing
+                // closer has been found, so a positioned match always wins.
+                if (bestLocalId <= 0) {
+                    bestLocalId = localId;
+                }
+                continue;
+            }
+
+            const dx = localX - canonicalX;
+            const dy = localY - canonicalY;
+            const distanceSq = (dx * dx) + (dy * dy);
+            if (distanceSq > EntityHandler.CANONICAL_VISIBLE_PROXY_MATCH_MAX_DISTANCE_SQ) {
+                continue;
+            }
+            if (distanceSq < bestDistanceSq) {
+                bestDistanceSq = distanceSq;
+                bestLocalId = localId;
+            }
+        }
+
+        if (bestLocalId > 0) {
+            console.log(
+                `[HostileSync] ${viewer.character?.name ?? '?'} had no bound copy of ${canonicalName} ` +
+                `canonical=${canonicalId} in ${levelScope}; adopted local=${bestLocalId} so it stops missing updates.`
+            );
+        }
+        return bestLocalId;
     }
 
     static getRegisteredHostileLocalIdForViewer(viewer: Client, canonical: any): number {
@@ -4230,11 +4634,32 @@ export class EntityHandler {
             EntityHandler.normalizeServerAuthorityHostileState(levelName, entityProps);
             if (EntityHandler.isServerAuthorityHostileEntity(levelName, entityProps)) {
                 noteDungeonRunEntitySeen(client, id, entityProps);
-                const canonicalDead = Boolean((entityProps as any).dead) ||
-                    Number(entityProps.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
                 if (!canonicalVisibleServerAuthority) {
+                    // Legacy path: the Flash client draws these itself from the room cues
+                    // and the server only reconciles the proxies it reports back.
                     continue;
                 }
+
+                // Canonical-visible levels: the server is the only source of enemies, so
+                // it must actually send them. Previously both branches fell through to
+                // `continue`, so turning the flag on changed nothing and the level would
+                // have rendered empty. Dead hostiles are already filtered above, which is
+                // what keeps a joiner from ever seeing what the party has killed.
+                const canonicalDead = Boolean((entityProps as any).dead) ||
+                    Number(entityProps.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
+                if (canonicalDead) {
+                    continue;
+                }
+                // The room boss stays client-spawned: a_Room_JCMini2_03 drives the whole
+                // encounter through its `am_Boss` cue (Defeated(), AddBuff, Skit, the intro
+                // and defeat cutscenes), so the client cue suppression deliberately skips
+                // it. Sending it from here as well would draw the boss twice.
+                if (Boolean((entityProps as any).isRoomBoss) || Boolean((entityProps as any).roomBoss)) {
+                    continue;
+                }
+                client.entities.set(id, { ...entityProps });
+                EntityHandler.rememberEntityKnown(client, levelName, entityProps);
+                EntityHandler.sendEntity(client, entityProps);
                 continue;
             }
             client.entities.set(id, { ...entityProps });
@@ -4243,6 +4668,28 @@ export class EntityHandler {
         }
         EntityHandler.sendTutorialDungeonWorldSnapshot(client, 'initial_entities_ready');
         MissionHandler.tryRestoreDungeonCompletionAfterReentry(client);
+    }
+
+    /**
+     * The session that owns this character *now*, when it is not the one being torn down.
+     *
+     * A door is two connections: the old socket closes and the client immediately opens a
+     * new one, and the close handler is not guaranteed to run first. When it runs second it
+     * used to tear down the body the successor had already spawned -- `removeOwnedEntities`
+     * matches player bodies by character name, and the name is the same on both sides of
+     * the door. The destroy went to everyone *except* the departing client, so the player
+     * who walked through the door became permanently invisible to the rest of the party
+     * while still seeing them: the reported "we act on the door and can no longer see each
+     * other even though we are standing in the same place".
+     */
+    private static resolveLiveSuccessorSession(client: Client): Client | null {
+        const characterName = client.character?.name;
+        if (!characterName) {
+            return null;
+        }
+
+        const owner = GlobalState.getActiveSessionByCharacterName(characterName);
+        return owner && owner !== client && GlobalState.isClientConnectionOpen(owner) ? owner : null;
     }
 
     static removeOwnedEntities(client: Client): number[] {
@@ -4255,17 +4702,29 @@ export class EntityHandler {
         const removedEntityProps = new Map<number, any>();
         const levelMap = EntityHandler.getLevelMap(levelName, client.levelInstanceId);
         const charNameNorm = EntityHandler.normalizeIdentityName(client.character?.name);
+        const successor = EntityHandler.resolveLiveSuccessorSession(client);
+        const successorEntityId = Math.max(0, Math.round(Number(successor?.clientEntID ?? 0)));
 
         if (levelMap) {
             for (const [entityId, entityProps] of Array.from(levelMap.entries())) {
+                // The successor's body is not this session's to remove, whatever the name
+                // on it says.
+                if (successorEntityId > 0 && entityId === successorEntityId) {
+                    continue;
+                }
+
                 const entityNameNorm = EntityHandler.normalizeIdentityName(entityProps?.name);
                 const isOwnedPlayer = Boolean(entityProps?.isPlayer) && (
                     (client.clientEntID > 0 && entityId === client.clientEntID) ||
-                    (charNameNorm && entityNameNorm === charNameNorm)
+                    // Matching by name is what catches a body left behind under an id this
+                    // session no longer remembers. It may only be trusted while nobody else
+                    // is playing that character.
+                    (!successor && charNameNorm && entityNameNorm === charNameNorm)
                 );
                 const isOwnedClientSpawn =
                     Boolean(entityProps?.clientSpawned) &&
                     Number(entityProps?.ownerToken ?? 0) === client.token &&
+                    (!successor || Number(entityProps?.ownerToken ?? 0) !== successor.token) &&
                     !EntityHandler.isServerAuthorityHostileEntity(levelName, entityProps);
 
                 if (isOwnedPlayer || isOwnedClientSpawn) {
@@ -4280,7 +4739,7 @@ export class EntityHandler {
             }
         }
 
-        if (client.playerSpawned && client.clientEntID > 0) {
+        if (client.playerSpawned && client.clientEntID > 0 && client.clientEntID !== successorEntityId) {
             removedEntityIds.add(client.clientEntID);
         }
 
@@ -4297,29 +4756,170 @@ export class EntityHandler {
         return Array.from(removedEntityIds);
     }
 
-    private static sendExistingPlayersToJoiner(joiner: Client): void {
-        for (const other of GlobalState.getSessionsInLevelScope(getClientLevelScope(joiner))) {
-            if (other === joiner) {
-                continue;
-            }
-            if (!other.playerSpawned || !areClientsInSameLevelScope(joiner, other)) {
-                continue;
-            }
-            if (other.userId && joiner.userId && other.userId === joiner.userId && other.character?.name === joiner.character?.name) {
-                continue;
-            }
-            if (!other.character || other.clientEntID <= 0) {
-                continue;
-            }
-
-            const otherProps = other.entities.get(other.clientEntID);
-            if (!otherProps) {
-                continue;
-            }
-
-            EntityHandler.sendEntity(joiner, Entity.fromCharacter(other.clientEntID, other.character, otherProps));
-            EntityHandler.sendOtherPlayerMountToJoiner(joiner, other);
+    /**
+     * Who else is standing in this scope, resolved from live sessions.
+     *
+     * Player visibility is the one thing that must never depend on an index being in
+     * step: a session missing from `sessionsByLevelScope` for even one spawn is a party
+     * member who is never sent, and nothing sends them again for the rest of the run --
+     * the reported "we walked through a door and now only one of us can see the other".
+     * These paths run on spawn and on gear/snapshot changes, not per frame, so the scan
+     * is affordable.
+     */
+    private static getSpawnedSessionsInScope(levelScope: string): Client[] {
+        if (!levelScope) {
+            return [];
         }
+
+        const sessions: Client[] = [];
+        for (const session of GlobalState.sessionsByToken.values()) {
+            if (session.playerSpawned && getClientLevelScope(session) === levelScope) {
+                sessions.push(session);
+            }
+        }
+        return sessions;
+    }
+
+    /**
+     * A player body about to be drawn on somebody else's screen, placed on floor.
+     *
+     * Seeding another client with a player is a spawn, and the client only snaps a spawn
+     * onto floor within 160px of where the server put it (see the note at the top of
+     * core/GroundedPosition). Handing it the live sample means handing it whatever the
+     * movement deltas add up to right now -- mid-jump, mid-knockback, or mid-boss-intro
+     * where the scripted camera work leaves the body well above the ground. Outside the
+     * snap window the client accepts the point and lets the body fall to the floor, which
+     * is the party members raining down at the start of the boss scene.
+     *
+     * The live position still wins whenever it is itself a confirmed standing sample; the
+     * grounded fallback only replaces a point the client never claimed to be standing on.
+     * Movement packets correct any small difference on the next frame.
+     */
+    private static withGroundedBodyPosition(entity: any, levelName: string | null | undefined): any | null {
+        if (!entity) {
+            return entity;
+        }
+
+        const grounded = resolveConfirmedGroundedPosition(entity, levelName);
+        if (!grounded) {
+            // No confirmed floor sample. If the body is airborne on top of that there is
+            // nothing safe to draw it at: the live point is somewhere in open air, and the
+            // client accepts it as given once it is outside the snap ray, which is the
+            // player materialising above the boss room and gliding down. Refuse the seed and
+            // let the resync pass send it once the client reports standing somewhere.
+            return isEntityAirborne(entity) ? null : entity;
+        }
+
+        const liveX = Math.round(Number(entity.x ?? NaN));
+        const liveY = Math.round(Number(entity.y ?? NaN));
+        if (liveX === grounded.x && liveY === grounded.y) {
+            return entity;
+        }
+
+        return { ...entity, x: grounded.x, y: grounded.y };
+    }
+
+    /**
+     * Draw one player on one other player's screen.
+     *
+     * Returns false when there is nothing safe to send yet. A body with no position would go
+     * out as 0,0 -- the world origin -- so a subject whose own client has not reported a
+     * position is skipped and left to the resync pass below rather than teleported.
+     */
+    private static sendPlayerBodyToViewer(viewer: Client, subject: Client): boolean {
+        if (
+            viewer === subject ||
+            !subject.character ||
+            subject.clientEntID <= 0 ||
+            !viewer.playerSpawned ||
+            !subject.playerSpawned ||
+            !areClientsInSameLevelScope(viewer, subject)
+        ) {
+            return false;
+        }
+        // The same character logged in twice is one player, not two bodies.
+        if (
+            viewer.userId &&
+            subject.userId &&
+            viewer.userId === subject.userId &&
+            viewer.character?.name === subject.character?.name
+        ) {
+            return false;
+        }
+
+        const props = subject.entities.get(subject.clientEntID);
+        if (!props) {
+            return false;
+        }
+
+        // Null means "nowhere safe to put this body yet" -- airborne with no confirmed floor
+        // sample. Seeding it anyway is the player appearing in mid-air and falling into the
+        // room, which is what this refuses to do.
+        const placed = EntityHandler.withGroundedBodyPosition(props, subject.currentLevel);
+        if (!placed) {
+            return false;
+        }
+
+        EntityHandler.sendEntity(
+            viewer,
+            Entity.fromCharacter(subject.clientEntID, subject.character, placed)
+        );
+        EntityHandler.sendOtherPlayerMountToJoiner(viewer, subject);
+        return true;
+    }
+
+    /**
+     * Make everybody in this scope visible to everybody else, both directions.
+     *
+     * Player visibility used to be two one-shot half-exchanges -- the joiner pulled the
+     * others in on spawn, the others were pushed the joiner -- and either half failing left
+     * the pair permanently one-way, which is exactly what a door produced: the player who
+     * walked through saw the party and the party could not see them (or the reverse), for
+     * the rest of the run, with nothing to retry it.
+     *
+     * A door is also a race. The two connections and the two spawns interleave in any order,
+     * and a body the subject's own client has not reported yet cannot be sent at all. So this
+     * runs on spawn and again on a short retry, and it is symmetric: whichever half was not
+     * possible the first time is simply done on the next pass.
+     */
+    private static syncPlayerVisibilityInScope(client: Client): void {
+        const levelScope = getClientLevelScope(client);
+        if (!client.playerSpawned || !levelScope) {
+            return;
+        }
+
+        for (const other of EntityHandler.getSpawnedSessionsInScope(levelScope)) {
+            if (other === client) {
+                continue;
+            }
+
+            EntityHandler.sendPlayerBodyToViewer(client, other);
+            EntityHandler.sendPlayerBodyToViewer(other, client);
+        }
+    }
+
+    static schedulePlayerVisibilityResync(client: Client): void {
+        const token = client.token;
+        for (const delayMs of EntityHandler.PLAYER_VISIBILITY_RESYNC_DELAYS_MS) {
+            setTimeout(() => {
+                // Deliberately not pinned to the scope captured at schedule time. The scope
+                // guard can move a session onto the party's instance at any point after it
+                // spawns (combat relay, level entry), and a retry cancelled because the
+                // scope "changed" is a retry cancelled exactly when it was most needed --
+                // that is the run where the leader never receives the member who walked
+                // through the door. The token check is enough to drop a stale session.
+                if (!client.playerSpawned || client.token !== token) {
+                    return;
+                }
+
+                EntityHandler.syncPlayerVisibilityInScope(client);
+            }, delayMs).unref?.();
+        }
+    }
+
+    private static sendExistingPlayersToJoiner(joiner: Client): void {
+        EntityHandler.syncPlayerVisibilityInScope(joiner);
+        EntityHandler.schedulePlayerVisibilityResync(joiner);
 
         EntityHandler.replayStartedDungeonRoomEventsToJoiner(joiner);
         EntityHandler.scheduleExistingVisibleClientSpawnEntitiesToJoiner(joiner);
@@ -4371,11 +4971,25 @@ export class EntityHandler {
             return;
         }
 
-        for (const other of GlobalState.getSessionsInLevelScope(getClientLevelScope(client))) {
+        // Self keeps the live position -- correcting a player's own body under them is a
+        // rubber-band. Everyone else is being handed a spawn, so it goes on floor.
+        const remoteEntity = EntityHandler.withGroundedBodyPosition(playerEntity, client.currentLevel);
+        for (const other of EntityHandler.getSpawnedSessionsInScope(getClientLevelScope(client))) {
             if ((!includeSelf && other === client) || !other.playerSpawned || !areClientsInSameLevelScope(client, other)) {
                 continue;
             }
-            EntityHandler.sendEntity(other, playerEntity);
+            if (other === client) {
+                EntityHandler.sendEntity(other, playerEntity);
+                continue;
+            }
+            // Airborne with no confirmed floor sample: nothing safe to draw on a remote
+            // screen, so this refresh skips them and the resync pass picks it up.
+            if (remoteEntity) {
+                EntityHandler.sendEntity(other, remoteEntity);
+            }
+        }
+        if (!remoteEntity) {
+            EntityHandler.schedulePlayerVisibilityResync(client);
         }
     }
 

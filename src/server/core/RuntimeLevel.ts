@@ -2,6 +2,8 @@ import type { Character } from '../database/Database';
 import { GameData } from './GameData';
 import { GlobalState } from './GlobalState';
 import type { Client } from './Client';
+import { LevelConfig } from './LevelConfig';
+import { getScopeLevelName } from './LevelScope';
 import { getPartyIdForClient } from './PartySync';
 
 export function clampRuntimeLevel(value: unknown, fallbackLevel: number = 1): number {
@@ -64,6 +66,20 @@ export function getScopeRuntimeLevel(
     fallbackLevel: number = 1
 ): number {
     const scopeKey = String(levelScope ?? '').trim();
+
+    // A dungeon's difficulty is the dungeon's, not the party's. Deriving it from the
+    // highest player level in the scope meant the number depended on who the server
+    // believed was standing there at that instant -- so a level 22 and a level 50 in one
+    // run could be handed two different sets of enemies, and adding a high level player
+    // to a party silently re-tuned the dungeon for everyone. The authored tier is fixed
+    // per level, so every party member gets the recommended difficulty and gets the same
+    // one, in every ordering.
+    const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel(getScopeLevelName(scopeKey));
+    if (authoredLevel > 0) {
+        scopeRuntimeLevels.set(scopeKey, authoredLevel);
+        return authoredLevel;
+    }
+
     if (!scopeKey) {
         return getPartyRuntimeLevelForClient(joiningClient, joiningClient?.character, fallbackLevel);
     }

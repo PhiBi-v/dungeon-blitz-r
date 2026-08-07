@@ -108,6 +108,10 @@ function resetScope(scope: string, clients: FakeClient[]): void {
 // the asking client's own party, so two ungrouped players in one dungeon
 // instance watched the same boss at two different levels — and therefore two
 // different health bars.
+//
+// The answer is no longer "the highest player in the instance" but the dungeon's own
+// authored tier, so the number does not depend on who the server believes is standing
+// there when it is asked. Everything below still asserts agreement first.
 function testScopeRuntimeLevelIgnoresPartyBoundaries(): void {
     const veteran = createFakeClient('Veteran', 41001, 50);
     const rookie = createFakeClient('Rookie', 41002, 12);
@@ -117,26 +121,47 @@ function testScopeRuntimeLevelIgnoresPartyBoundaries(): void {
 
     const veteranView = getScopeRuntimeLevel(scope, veteran as never, 1);
     const rookieView = getScopeRuntimeLevel(scope, rookie as never, 1);
+    const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel(LEVEL_NAME);
 
+    assert.ok(authoredLevel > 0, `${LEVEL_NAME} should carry an authored dungeon tier`);
     assert.equal(veteranView, rookieView, 'ungrouped players in one dungeon instance must scale it identically');
-    assert.equal(veteranView, 50, 'scope scaling should follow the highest level player in the instance');
+    assert.equal(
+        veteranView,
+        authoredLevel,
+        'scope scaling should be the dungeon\'s recommended difficulty, not the party roster'
+    );
 
     resetScope(scope, [veteran, rookie]);
 }
 
-function testScopeRuntimeLevelDoesNotFallWhenTheTopPlayerLeaves(): void {
+// A level 50 walking in must not make the dungeon harder for the level 12 already in
+// it, and walking back out must not make it easier. Both directions are the same
+// property now: the tier belongs to the level.
+function testScopeRuntimeLevelDoesNotMoveWithTheRoster(): void {
     const veteran = createFakeClient('Veteran', 42001, 50);
     const rookie = createFakeClient('Rookie', 42002, 12);
     const scope = getLevelScopeKey(LEVEL_NAME, INSTANCE_ID);
-    GlobalState.sessionsByToken.set(veteran.token, veteran as never);
+    const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel(LEVEL_NAME);
+
     GlobalState.sessionsByToken.set(rookie.token, rookie as never);
-    assert.equal(getScopeRuntimeLevel(scope, null, 1), 50, 'scope should scale to the veteran while they are present');
+    assert.equal(
+        getScopeRuntimeLevel(scope, rookie as never, 1),
+        authoredLevel,
+        'a lone low level player still gets the dungeon\'s own difficulty'
+    );
+
+    GlobalState.sessionsByToken.set(veteran.token, veteran as never);
+    assert.equal(
+        getScopeRuntimeLevel(scope, null, 1),
+        authoredLevel,
+        'a high level player joining must not re-tune the dungeon under the party'
+    );
 
     GlobalState.sessionsByToken.delete(veteran.token);
 
     assert.equal(
         getScopeRuntimeLevel(scope, rookie as never, 1),
-        50,
+        authoredLevel,
         'a boss must not heal mid-fight because the highest level player disconnected'
     );
 
@@ -301,7 +326,7 @@ function main(): void {
         GlobalState.levelEntities.clear();
 
         testScopeRuntimeLevelIgnoresPartyBoundaries();
-        testScopeRuntimeLevelDoesNotFallWhenTheTopPlayerLeaves();
+        testScopeRuntimeLevelDoesNotMoveWithTheRoster();
         testEveryBossCopyLandsOnOneRecord();
         testDamageLedgerSurvivesCopyReregistration();
         testDamageFromEveryParticipantAggregatesOnce();

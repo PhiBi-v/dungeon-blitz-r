@@ -221,17 +221,26 @@ function attachProxy(client: FakeClient, localId: number, enemyIndex: number): v
 
 function assertFiveCanonicalHostiles(scope: string): void {
     const hostiles = getHostiles(scope);
-    assert.equal(hostiles.length, 5, 'JC_Mini2 should seed exactly five canonical hostiles');
+    // The dungeon's own authored tier, identical for every party member -- not the flat 50
+    // this level used to pin every hostile to. See LevelConfig.getAuthoredDungeonEnemyLevel.
+    const authoredLevel = LevelConfig.getAuthoredDungeonEnemyLevel('JC_Mini2');
+    assert.equal(authoredLevel, 29, 'JC_Mini2 is authored at tier 29');
+    assert.equal(hostiles.length, 35, 'JC_Mini2 should seed every canonical hostile placed in the room display lists');
     for (const hostile of hostiles) {
         assert.equal(hostile.clientSpawned, false, `${hostile.name} should be server canonical`);
-        assert.equal(hostile.level, 50, `${hostile.name} should be normalized to level 50`);
+        assert.equal(hostile.level, authoredLevel, `${hostile.name} should be normalized to the dungeon's own tier`);
         assert.equal(hostile.requiredForClear, true, `${hostile.name} should be required for clear`);
         assert.equal(hostile.generatedFromScript, true, `${hostile.name} should be marked as script-generated`);
         assert.ok(String(hostile.spawnKey ?? '').includes('the_east_wing'), `${hostile.name} should keep a stable East Wing spawn key`);
-        assert.ok(Number(hostile.maxHp ?? 0) > 100, `${hostile.name} should have level-50 maxHp`);
+        assert.equal(
+            Number(hostile.maxHp ?? 0),
+            EntityHandler.estimateServerAuthorityHostileMaxHp(hostile, 'JC_Mini2'),
+            `${hostile.name} should be sized from the dungeon tier, not a flat level 50 row`
+        );
+        assert.ok(Number(hostile.maxHp ?? 0) > 0, `${hostile.name} should have a health pool`);
     }
 
-    const boss = GlobalState.levelEntities.get(scope)?.get(920004);
+    const boss = GlobalState.levelEntities.get(scope)?.get(920024);
     assert.equal(Boolean(boss?.roomBoss), true, 'TowerGuard2 should be marked as a room boss');
     assert.equal(boss?.displayName, 'Tanja, The 2nd Daughter', 'TowerGuard2 display name should come from InitRoom');
 }
@@ -239,17 +248,24 @@ function assertFiveCanonicalHostiles(scope: string): void {
 function testRegistryLoad(): void {
     const config = getConfig();
     assert.equal(config.source?.swf, 'src/client/content/localhost/p/cbp/LevelsJC.swf', 'registry should identify the source SWF');
-    assert.equal(config.enemies.length, 5, 'registry should contain five enemies');
-    assert.equal(config.enemies.filter((enemy) => enemy.requiredForClear).length, 5, 'all East Wing enemies should be required for clear');
+    assert.equal(config.enemies.length, 35, 'registry should contain every placed enemy, not only the named ActionScript cues');
+    assert.equal(config.enemies.filter((enemy) => enemy.requiredForClear).length, 35, 'all East Wing enemies should be required for clear');
     assert.equal(config.enemies.filter((enemy) => enemy.boss || enemy.miniboss).length, 1, 'registry should identify one boss/miniboss');
 
     const npcs = NpcLoader.getNpcsForLevel('JC_Mini2');
-    assert.equal(npcs.length, 5, 'NpcLoader should expose the generated East Wing enemies');
+    assert.equal(npcs.length, 35, 'NpcLoader should expose the generated East Wing enemies');
     assert.equal(npcs[0].id, 920001, 'generated canonical ids should be stable');
     assert.equal(usesSharedDungeonProgress('JC_Mini2'), true, 'generated required-for-clear dungeon should use shared progress');
 }
 
-function testInitialCanonicalNoVisibleServerSnapshots(): void {
+/**
+ * The East Wing is canonical-visible: the SERVER draws the enemies, so it must send every
+ * live canonical hostile on entry. This used to assert the opposite — the client drew them
+ * from its own room cues and the server sent nothing — which is exactly why a joiner kept
+ * seeing enemies the party had already killed: the client invented them locally and
+ * ignored the server's destroy.
+ */
+function testInitialCanonicalSendsVisibleServerHostiles(): void {
     const zeus = createFakeClient('Zeus', 'east-wing-initial', 13933, 1);
     attachPlayer(zeus);
     GlobalState.sessionsByToken.set(zeus.token, zeus as never);
@@ -257,7 +273,21 @@ function testInitialCanonicalNoVisibleServerSnapshots(): void {
     const scope = getLevelScopeKey(zeus.currentLevel, zeus.levelInstanceId);
 
     assertFiveCanonicalHostiles(scope);
-    assert.equal(zeus.sentPackets.some((packet) => packet.id === 0x0F), false, 'initial sync should not send visible server hostile snapshots');
+
+    const visibleCount = zeus.sentPackets.filter((packet) => packet.id === 0x0F).length;
+    if (EntityHandler.usesCanonicalVisibleServerAuthorityHostiles('JC_Mini2')) {
+        // Server-drawn mode: the server owns rendering and must send the live roster, or
+        // the level draws empty. 34 rather than 35 — the room boss stays client-spawned
+        // because a_Room_JCMini2_03 drives the encounter through its am_Boss cue, so the
+        // SWF cue suppression skips it and sending it here would draw it twice.
+        assert.equal(visibleCount, 34, 'server-drawn mode must send every live hostile except the client-owned boss');
+        const boss = GlobalState.levelEntities.get(scope)?.get(920024);
+        assert.equal(Boolean(boss?.roomBoss), true, 'the excluded entity must be the room boss');
+    } else {
+        // Default: the Flash client still draws the enemies from its own room cues, so
+        // sending them too would double every enemy on screen.
+        assert.equal(visibleCount, 0, 'client-drawn mode must not send visible hostile snapshots');
+    }
 }
 
 async function testProxyAttachKillProgressAndLateJoiner(): Promise<void> {
@@ -289,8 +319,8 @@ async function testProxyAttachKillProgressAndLateJoiner(): Promise<void> {
 
     const totals = getSharedDungeonProgressTotals(starterScope);
     const progressState = recomputeSharedDungeonProgress(starterScope);
-    assert.deepEqual(totals, { total: 5, defeated: 1 }, 'required-for-clear totals should count server canonical enemies');
-    assert.equal(progressState?.progress, 20, 'East Wing progress should be floor(deadRequired / totalRequired * 100)');
+    assert.deepEqual(totals, { total: 35, defeated: 1 }, 'required-for-clear totals should count server canonical enemies');
+    assert.equal(progressState?.progress, 2, 'East Wing progress should be floor(deadRequired / totalRequired * 100) = floor(1/35*100)');
 
     attachPlayer(telahair);
     GlobalState.sessionsByToken.set(telahair.token, telahair as never);
@@ -334,7 +364,7 @@ async function main(): Promise<void> {
         testRegistryLoad();
 
         resetRuntime();
-        testInitialCanonicalNoVisibleServerSnapshots();
+        testInitialCanonicalSendsVisibleServerHostiles();
 
         resetRuntime();
         await testProxyAttachKillProgressAndLateJoiner();

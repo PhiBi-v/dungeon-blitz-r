@@ -1,5 +1,17 @@
 #!/usr/bin/env node
-
+//
+// SUPERSEDED — DO NOT RUN. Use exportEastWingEnemiesFromDisplayList.js instead.
+//
+// This script finds enemies by reading the rooms' decompiled ActionScript for
+// `public var __idNNN_:ac_Type` declarations. Only cues that were given an instance
+// name in Flash produce such a declaration, and 30 of the East Wing's 35 hostiles are
+// placed on the room timeline with no instance name. Running this would shrink the
+// canonical spawn table back to 5 enemies, and every enemy missing from that table is
+// re-registered per-client as a `clientSpawned` entity that only one player can see —
+// which is exactly the "each player spawns their own enemies" bug.
+//
+// Kept only for its FFDec/ActionScript plumbing and the authored `sayOn*` strings.
+//
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
