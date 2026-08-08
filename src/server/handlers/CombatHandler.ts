@@ -3041,6 +3041,7 @@ export class CombatHandler {
         entity.entState = EntityState.DEAD;
         entity.deathFinalizedAt = Math.max(0, Math.round(Number(entity.deathFinalizedAt ?? 0))) || finalizedAt;
         entity.finalDeathReason = options.reason ?? 'hostile_death';
+        CombatHandler.recordHostileDeathPosition(anchor, levelScope, entityId, entity);
         entity.aggroTargetEntityId = 0;
         entity.aggroTargetToken = 0;
         entity.targetEntityId = 0;
@@ -3129,7 +3130,7 @@ export class CombatHandler {
                 }
             }
 
-            CombatHandler.handleCanonicalVisibleServerAuthorityDefeatSideEffects(anchor, levelScope, entity);
+            CombatHandler.handleServerAuthorityDefeatSideEffects(anchor, levelScope, entity);
             CombatHandler.grantTutorialCompletionBossReward(
                 anchor,
                 levelScope,
@@ -3456,6 +3457,23 @@ export class CombatHandler {
             return false;
         }
 
+        // Bind the copy the viewer is already drawing, before anything else gets a chance to
+        // hand them another one. This has to come first: `canViewerResolveCombatEntity`
+        // falls through to `ensureEntityKnown`, which makes an entity "known" by *sending*
+        // it -- so an unbound viewer ended up with a second enemy under the canonical id,
+        // standing next to the one their own client drew. Skipping them instead drops every
+        // health update, which is an enemy dead on one screen and alive on the other. Binding
+        // is the only answer that is neither.
+        const adopted = EntityHandler.resolveHostileLocalIdForViewer(
+            viewer,
+            levelScope,
+            canonicalId,
+            `ensure-known:${reason}`
+        );
+        if (adopted.ok && adopted.localId > 0) {
+            return true;
+        }
+
         const before = CombatHandler.getServerAuthorityViewerEntityState(viewer, canonicalId);
         if (CombatHandler.canViewerResolveCombatEntity(viewer, levelScope, canonicalId)) {
             if (!before.knownCanonical && !before.hasCanonicalEntity) {
@@ -3469,8 +3487,7 @@ export class CombatHandler {
 
         EntityHandler.sendEntity(viewer, entity);
         const after = CombatHandler.getServerAuthorityViewerEntityState(viewer, canonicalId);
-        const resolved = after.knownCanonical || after.hasCanonicalEntity || after.knownLocal || after.hasLocalEntity;
-        return resolved;
+        return after.knownCanonical || after.hasCanonicalEntity || after.knownLocal || after.hasLocalEntity;
     }
 
     private static syncServerAuthorityNpcViewerCache(viewer: Client, entity: any): {
@@ -5023,7 +5040,65 @@ export class CombatHandler {
         });
     }
 
-    private static handleCanonicalVisibleServerAuthorityDefeatSideEffects(
+    /**
+     * Loot for a hostile the server owns.
+     *
+     * This used to be gated on `usesCanonicalVisibleServerAuthorityHostiles` -- the
+     * opt-in "the server draws the enemies" flag, which is off. But `handleGrantReward`
+     * *refuses* a client's own reward request for these levels
+     * (`requiresCanonicalHostileLootContext` is true for every server-authority level),
+     * precisely because the server is meant to be the one granting it. With the client
+     * refused and the server gated off, the two halves cancelled: every enemy in The East
+     * Wing and JC_Mini1Hard died and dropped nothing at all.
+     *
+     * Owning the hostile is the right condition, not drawing it. There is no double-drop
+     * risk from widening it, because it is the same predicate that refuses the client's
+     * request. Rewards still fan out per party member through
+     * `grantServerEnemyRewardToEligibleViewers`, once each, keyed on the death's loot nonce.
+     */
+    /**
+     * Where this hostile actually died, from the screen that killed it.
+     *
+     * The canonical entity's own x/y is the server's simulation of the enemy, and for a
+     * client-drawn level that is not where anybody saw it standing: the client animates its
+     * own proxy, so by the time the enemy dies the two have drifted apart. Dropping loot at
+     * the canonical position is what scattered rewards around the room instead of leaving
+     * them on the corpse.
+     *
+     * Recorded once, at the moment the death is finalized, from the killer's own local copy
+     * -- so every party member's drop lands on the same spot, the one the kill happened on.
+     * The canonical position remains the fallback for a killer with no local copy.
+     */
+    private static recordHostileDeathPosition(
+        anchor: Client,
+        levelScope: string,
+        entityId: number,
+        entity: any
+    ): void {
+        if (!entity || Math.max(0, Math.round(Number(entity.deathX ?? NaN))) > 0) {
+            return;
+        }
+
+        const localId = EntityHandler.getRegisteredHostileLocalIdForViewer(anchor, entity) ||
+            EntityHandler.resolveEntityLocalId(anchor, entityId);
+        const localCopy = localId > 0 ? anchor.entities.get(localId) : null;
+        const sourceX = Number(localCopy?.x ?? entity.x ?? NaN);
+        const sourceY = Number(localCopy?.y ?? entity.y ?? NaN);
+        if (!Number.isFinite(sourceX) || !Number.isFinite(sourceY)) {
+            return;
+        }
+
+        entity.deathX = Math.round(sourceX);
+        entity.deathY = Math.round(sourceY);
+
+        const levelEntity = GlobalState.levelEntities.get(levelScope)?.get(entityId);
+        if (levelEntity && levelEntity !== entity) {
+            levelEntity.deathX = entity.deathX;
+            levelEntity.deathY = entity.deathY;
+        }
+    }
+
+    private static handleServerAuthorityDefeatSideEffects(
         client: Client,
         levelScope: string,
         entity: any
@@ -5035,7 +5110,6 @@ export class CombatHandler {
             : entity;
         if (
             !levelName ||
-            !EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelName) ||
             !EntityHandler.isServerAuthorityHostileEntity(levelName, canonicalEntity)
         ) {
             return;
@@ -5044,6 +5118,12 @@ export class CombatHandler {
         const hp = Math.round(Number(canonicalEntity?.hp ?? 0));
         const dead = Boolean(canonicalEntity?.dead) || Number(canonicalEntity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
         if (hp <= 0 && dead && !Boolean(canonicalEntity?.destroyed)) {
+            // Only the canonical-visible configuration finalizes from here. On the legacy
+            // path the ordinary death transaction owns that, and finalizing twice would
+            // replay the death packets.
+            if (!EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelName)) {
+                return;
+            }
             CombatHandler.finalizeHostileDeath(client, levelScope, canonicalId, canonicalEntity, {
                 includeAnchor: true,
                 sendHpCorrection: false,
@@ -5179,7 +5259,7 @@ export class CombatHandler {
 
         CombatHandler.markEnemyDefeatProcessed(levelScope, entityId, entity);
         TutorialDungeonMechanics.noteEntityDefeated(client, entity);
-        CombatHandler.handleCanonicalVisibleServerAuthorityDefeatSideEffects(client, levelScope, entity);
+        CombatHandler.handleServerAuthorityDefeatSideEffects(client, levelScope, entity);
         CombatHandler.fireAndForgetMissionWork(
             client,
             'enemy defeat mission progress',

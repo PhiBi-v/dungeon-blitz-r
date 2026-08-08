@@ -488,15 +488,74 @@ export class EntityHandler {
         for (const session of GlobalState.sessionsByToken.values()) {
             if (
                 session !== client &&
-                session.playerSpawned &&
                 !session.socket?.destroyed &&
-                getClientLevelScope(session) === levelScope
+                getClientLevelScope(session) === levelScope &&
+                // Not `playerSpawned`. A party member between their dungeon login and their
+                // first entity update is playing this run -- they simply have no body yet --
+                // and treating that gap as "nobody is here" is what let the next player
+                // through the door wipe the run: progress back to 0% and every enemy the
+                // party had killed standing up again.
+                EntityHandler.isInboundScopeAnchorSession(session)
             ) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * True when this run has already been played -- shared progress above zero, or a
+     * completion state that has recorded something.
+     *
+     * The fresh-run resets exist to stop a *finished* run's corpses leaking into the next
+     * one. They must never fire on a run in progress, and "is anybody standing here" turned
+     * out to be too weak a test for that on its own: a single moment where the only other
+     * player is mid-load reads as an empty scope. Progress is the durable evidence that a
+     * run exists, so it vetoes the reset outright.
+     */
+    private static hasRecordedRunProgress(levelScope: string): boolean {
+        if (!levelScope) {
+            return false;
+        }
+
+        if (Math.max(0, Math.round(Number(GlobalState.levelQuestProgress.get(levelScope)?.progress ?? 0))) > 0) {
+            return true;
+        }
+
+        const levelMap = GlobalState.levelEntities.get(levelScope);
+        if (!levelMap) {
+            return false;
+        }
+
+        for (const entity of levelMap.values()) {
+            if (
+                !entity?.isPlayer &&
+                Number(entity?.team ?? 0) === EntityTeam.ENEMY &&
+                EntityHandler.isEntityDead(entity)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * True when this session is *arriving* in its level rather than leaving it.
+     *
+     * A session that has spawned obviously qualifies. One that has not is only an anchor if
+     * login has bound it to a dungeon instance: `clearTransferState` wipes that binding on
+     * the way out, so a player walking out of the dungeon -- who still reports it as their
+     * current level -- can never be mistaken for one walking in.
+     */
+    private static isInboundScopeAnchorSession(session: Client): boolean {
+        if (session.playerSpawned) {
+            return true;
+        }
+
+        return Boolean(String(session.levelInstanceId ?? '').trim()) &&
+            GlobalState.sessionsByToken.get(session.token) === session;
     }
 
     private static selectJcMini1PartyScopeAnchor(client: Client, levelName: string): Client | null {
@@ -509,11 +568,19 @@ export class EntityHandler {
         for (const session of GlobalState.getSessionsInParty(getPartyIdForClient(client))) {
             if (
                 session === client ||
-                !session.playerSpawned ||
                 !session.character ||
                 !GlobalState.isSessionOpen(session) ||
                 LevelConfig.normalizeLevelName(session.currentLevel) !== levelName ||
-                !areClientsInSameParty(client, session)
+                !areClientsInSameParty(client, session) ||
+                // Not `playerSpawned`. A party member whose client is still loading the
+                // dungeon already owns the run -- login bound them to its instance -- and
+                // requiring a body here is what let the next member through the door open a
+                // second, private run instead: their own untouched roster, their own 0%
+                // progress bar, and every enemy the party had already killed back on their
+                // feet. The bound instance is what separates an arriving member from one
+                // walking out, whose binding login clears. Same rule as
+                // LevelHandler.isInboundTransferSyncAnchorSession.
+                !EntityHandler.isInboundScopeAnchorSession(session)
             ) {
                 continue;
             }
@@ -701,6 +768,84 @@ export class EntityHandler {
         }
     }
 
+    /**
+     * Re-decide every hostile this client is drawing against the run it just joined.
+     *
+     * A player who enters while the party's anchor is still loading keeps their own
+     * instance for a moment and seeds a full, untouched roster into it. Their client then
+     * spawns all of it and each proxy binds to a *live* canonical in that private scope. By
+     * the time the scope guard moves them onto the party's run the bindings already exist,
+     * so they carry on fighting enemies the party cleared long ago -- the reported "the
+     * player who joins later gets the 25% of enemies back".
+     *
+     * Canonical ids are stable across instances (they come from the spawn table, not from
+     * the run), so the fix is simply to look each local copy up again in the scope that is
+     * now authoritative: dead there means destroy it, alive there means rebind it, and
+     * matching nothing at all on a closed-roster level means it was never real.
+     */
+    private static reconcileClientHostilesWithScope(client: Client, levelName: string, levelScope: string): void {
+        if (!EntityHandler.usesServerAuthorityHostiles(levelName) || !client.entities?.size) {
+            return;
+        }
+
+        const levelMap = GlobalState.levelEntities.get(levelScope);
+        if (!levelMap) {
+            return;
+        }
+
+        let destroyed = 0;
+        let rebound = 0;
+        for (const [localId, local] of Array.from(client.entities.entries())) {
+            if (
+                localId <= 0 ||
+                !local ||
+                local.isPlayer ||
+                Number(local.team ?? 0) !== EntityTeam.ENEMY
+            ) {
+                continue;
+            }
+
+            // The id this copy was already bound to resolves in the new scope too, because
+            // the roster is the same table. Fall back to the positional matcher when there
+            // is no binding yet.
+            const boundCanonicalId = Math.max(0, Math.round(Number(
+                client.entityIdAliases?.get(localId) ?? local.canonicalEntityId ?? local.sharedCanonicalId ?? 0
+            ) || 0));
+            const canonical = (boundCanonicalId > 0 ? levelMap.get(boundCanonicalId) : null) ??
+                EntityHandler.findServerAuthorityProxyCanonical(levelName, levelMap, local, client);
+
+            if (!canonical) {
+                if (EntityHandler.rejectsUnmatchedClientHostiles(levelName)) {
+                    EntityHandler.destroyClientLocalEntity(client, localId, 'scope_adopt_unmatched_hostile', local);
+                    destroyed++;
+                }
+                continue;
+            }
+
+            const canonicalId = Math.max(0, Math.round(Number(canonical.id ?? 0)));
+            if (EntityHandler.isEntityDead(canonical)) {
+                if (canonicalId > 0 && canonicalId !== localId) {
+                    EntityHandler.rememberEntityAlias(client, localId, canonicalId);
+                }
+                EntityHandler.destroyDeadServerAuthorityLocalProxy(client, local, localId);
+                destroyed++;
+                continue;
+            }
+
+            if (canonicalId > 0) {
+                EntityHandler.registerCanonicalHostileAlias(client, levelScope, canonical, localId, 'scope_adopt_rebind');
+                rebound++;
+            }
+        }
+
+        if (destroyed > 0 || rebound > 0) {
+            console.log(
+                `[PartyScope] ${client.character?.name ?? '?'} reconciled hostiles onto ${levelScope}: ` +
+                `${destroyed} removed as already dead or unknown, ${rebound} rebound to the party's copies.`
+            );
+        }
+    }
+
     static ensureJcMini1PartySharedScope(client: Client, rawLevelName: string | null | undefined, reason: string): string {
         const levelName = LevelConfig.normalizeLevelName(rawLevelName) || '';
         if (!EntityHandler.usesServerAuthorityHostiles(levelName)) {
@@ -739,6 +884,12 @@ export class EntityHandler {
             client.levelInstanceId = targetInstanceId;
             EntityHandler.moveClientOwnedEntitiesBetweenScopes(client, oldScope, newScope);
             GlobalState.refreshSessionIndexes(client);
+            EntityHandler.reconcileClientHostilesWithScope(client, levelName, newScope);
+            // The progress bar was resolved against the scope this session used to be in --
+            // a private run, so 0% -- and nothing re-sent it when they were moved onto the
+            // party's. That is the joiner standing next to a party at 25% with an empty bar.
+            const { LevelHandler } = require('./LevelHandler') as typeof import('./LevelHandler');
+            LevelHandler.syncSharedDungeonQuestProgressState(client);
         } else if (reason === 'send_initial_level_entities') {
             // The "scope was already correct" outcome used to be completely silent, which
             // made it impossible to tell a working share from a failed one. Report the
@@ -1582,6 +1733,21 @@ export class EntityHandler {
             return;
         }
 
+        // Had this client been shown this enemy before? The HP drain and the DEAD state
+        // below exist to converge a copy the player has been *fighting* -- they make the
+        // bar empty and the body play its death. For an enemy the party killed before this
+        // player ever arrived, they do the opposite of what is wanted: the client draws the
+        // enemy from its own room cue, the server answers with a death, and the joiner
+        // watches a corpse-to-be spawn in and die in front of them. Nothing to converge and
+        // nothing to mourn -- take it straight back out.
+        const wasKnownToClient = client.entities.has(localId) || client.knownEntityIds.has(localId);
+        if (!wasKnownToClient) {
+            client.send(0x0D, EntityHandler.buildDestroyEntityPayload(localId));
+            client.entities.delete(localId);
+            client.knownEntityIds.delete(localId);
+            return;
+        }
+
         const deadSnapshot = {
             ...entity,
             id: localId,
@@ -1675,8 +1841,12 @@ export class EntityHandler {
             return;
         }
 
-        // A joiner must never wipe a run its party is still playing.
-        if (EntityHandler.hasOtherActiveSessionInScope(client, levelScope)) {
+        // A joiner must never wipe a run its party is still playing -- not while somebody
+        // else is in it, and not while it has anything to show for itself either.
+        if (
+            EntityHandler.hasOtherActiveSessionInScope(client, levelScope) ||
+            EntityHandler.hasRecordedRunProgress(levelScope)
+        ) {
             return;
         }
 
@@ -1713,7 +1883,11 @@ export class EntityHandler {
         }
 
         const levelScope = getLevelScopeKey(levelName, client.levelInstanceId);
-        if (!levelScope || EntityHandler.hasOtherActiveSessionInScope(client, levelScope)) {
+        if (
+            !levelScope ||
+            EntityHandler.hasOtherActiveSessionInScope(client, levelScope) ||
+            EntityHandler.hasRecordedRunProgress(levelScope)
+        ) {
             return;
         }
 

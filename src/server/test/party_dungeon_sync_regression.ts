@@ -13,6 +13,7 @@ import { clearScopeRuntimeLevel, getScopeRuntimeLevel } from '../core/RuntimeLev
 import { CombatHandler } from '../handlers/CombatHandler';
 import { EntityHandler } from '../handlers/EntityHandler';
 import { LevelHandler } from '../handlers/LevelHandler';
+import { RewardHandler } from '../handlers/RewardHandler';
 import { PacketRouter } from '../network/packetRouter';
 
 // Reported from a live two-player East Wing run, as three separate complaints that all
@@ -76,6 +77,7 @@ function resetState(): void {
     GlobalState.partyByMember.clear();
     GlobalState.sessionsByCharacterName.clear();
     GlobalState.levelEntities.clear();
+    GlobalState.levelQuestProgress.clear();
     clearScopeRuntimeLevel(SCOPE);
 }
 
@@ -679,6 +681,388 @@ function testRoomChangePushesThePlayerToEveryoneElse(): void {
     );
 }
 
+/**
+ * Server-owned hostiles must drop loot, once, for every party member.
+ *
+ * `handleGrantReward` refuses a client's own reward request on every server-authority level
+ * (`requiresCanonicalHostileLootContext`), because the server is meant to grant it. The
+ * server side was gated on the opt-in "server draws the enemies" flag, which is off, so the
+ * two halves cancelled and every East Wing enemy died dropping nothing at all.
+ */
+function testServerOwnedHostilesDropLootForTheWholeParty(): void {
+    const killer = createClient('Telahair', 82001, 50);
+    const partner = createClient('Lanorut', 82002, 22);
+    GlobalState.partyGroups.set(8802, {
+        id: 8802,
+        leader: 'Telahair',
+        members: ['Telahair', 'Lanorut'],
+        locked: false
+    });
+    GlobalState.partyByMember.set('telahair', 8802);
+    GlobalState.partyByMember.set('lanorut', 8802);
+    GlobalState.refreshSessionIndexes(killer);
+    GlobalState.refreshSessionIndexes(partner);
+
+    const hostile = createSharedBoss();
+    // A finished death: the reward hook only fires once the death transaction is complete.
+    hostile.hp = 0;
+    hostile.dead = true;
+    hostile.destroyed = true;
+    hostile.entState = EntityState.DEAD;
+    hostile.deathFinalizedAt = Date.now();
+    GlobalState.levelEntities.set(SCOPE, new Map<number, any>([[hostile.id, hostile]]));
+
+    (CombatHandler as any).handleServerAuthorityDefeatSideEffects(killer, SCOPE, hostile);
+
+    assert.equal(hostile.lootDropped, true, 'a server-owned hostile must drop loot when it dies');
+    assert.ok(String(hostile.lootDropNonce ?? ''), 'the drop must be stamped with a loot nonce');
+
+    const grantedTokens = hostile.lootGrantedTokens as Set<number>;
+    assert.ok(grantedTokens?.has(killer.token), 'the killer must receive the drop');
+    assert.ok(grantedTokens?.has(partner.token), 'every party member in the run must receive the drop');
+
+    // Idempotent: a second defeat notification must not hand out a second set.
+    const grantedCount = grantedTokens.size;
+    (CombatHandler as any).handleServerAuthorityDefeatSideEffects(killer, SCOPE, hostile);
+    assert.equal(grantedTokens.size, grantedCount, 'a repeated defeat notification must not drop twice');
+}
+
+/**
+ * Loot belongs on the corpse. `sourceEntity.x/y` is the server's own simulation of the
+ * enemy, and on a client-drawn level that has drifted from where anybody saw it standing --
+ * which scattered rewards around the room. The position is recorded once, when the death is
+ * finalized, from the screen that landed the kill.
+ */
+function testLootDropsWhereTheEnemyActuallyDied(): void {
+    const killer = createClient('Telahair', 83001, 50);
+    const hostile = createSharedBoss();
+    GlobalState.levelEntities.set(SCOPE, new Map<number, any>([[hostile.id, hostile]]));
+
+    // The killer's own copy, where that client rendered the enemy when it died. The
+    // canonical has drifted well away from it.
+    EntityHandler.registerCanonicalHostileAlias(killer, SCOPE, hostile, 500021, 'test_attach');
+    killer.entities.set(500021, {
+        id: 500021,
+        name: 'TowerGuard2',
+        EntName: 'TowerGuard2',
+        isPlayer: false,
+        team: EntityTeam.ENEMY,
+        entState: EntityState.ACTIVE,
+        x: 15880,
+        y: 6120
+    });
+
+    (CombatHandler as any).recordHostileDeathPosition(killer, SCOPE, hostile.id, hostile);
+
+    assert.equal(hostile.deathX, 15880, 'the drop must be anchored to where the kill happened');
+    assert.equal(hostile.deathY, 6120, 'the drop must be anchored to where the kill happened');
+
+    // Recorded once: a later notification must not move the loot off the corpse.
+    const localCopy = killer.entities.get(500021);
+    localCopy.x = 11000;
+    localCopy.y = 3000;
+    (CombatHandler as any).recordHostileDeathPosition(killer, SCOPE, hostile.id, hostile);
+    assert.equal(hostile.deathX, 15880, 'the death position must be recorded once and stay put');
+
+    // And the reward actually uses it, rather than the canonical's drifted position.
+    hostile.hp = 0;
+    hostile.dead = true;
+    hostile.destroyed = true;
+    hostile.entState = EntityState.DEAD;
+    hostile.deathFinalizedAt = Date.now();
+
+    const dropPositions: Array<{ x: number; y: number }> = [];
+    const originalApply = (RewardHandler as any).applyRewardToRecipient;
+    (RewardHandler as any).applyRewardToRecipient = (
+        _recipient: Client,
+        _reward: any,
+        _nonce: unknown,
+        _sourceEntity: any,
+        dropPosition: { x: number; y: number }
+    ) => {
+        dropPositions.push(dropPosition);
+    };
+    try {
+        (CombatHandler as any).handleServerAuthorityDefeatSideEffects(killer, SCOPE, hostile);
+    } finally {
+        (RewardHandler as any).applyRewardToRecipient = originalApply;
+    }
+
+    assert.ok(dropPositions.length > 0, 'the death should have produced a drop');
+    assert.deepEqual(
+        dropPositions[0],
+        { x: 15880, y: 6120 },
+        'the drop must land on the corpse, not on the canonical entity\'s simulated position'
+    );
+}
+
+/**
+ * The late joiner. A player entering while the anchor is still loading keeps their own
+ * instance for a moment, seeds an untouched roster into it, and their client binds to those
+ * live copies. When the scope guard moves them onto the party's run they must not carry
+ * those bindings with them: enemies the party already killed are dead for them too.
+ */
+function testJoiningAPartyRunRemovesEnemiesItAlreadyKilled(): void {
+    const host = createClient('Telahair', 84001, 50);
+    const joiner = createClient('Lanorut', 84002, 22);
+    GlobalState.partyGroups.set(8804, {
+        id: 8804,
+        leader: 'Telahair',
+        members: ['Telahair', 'Lanorut'],
+        locked: false
+    });
+    GlobalState.partyByMember.set('telahair', 8804);
+    GlobalState.partyByMember.set('lanorut', 8804);
+    GlobalState.refreshSessionIndexes(host);
+    GlobalState.refreshSessionIndexes(joiner);
+
+    // The party's run: one enemy already killed, one still standing.
+    const killed = { ...createSharedBoss(), id: 920005, name: 'Ghoul', EntName: 'Ghoul', x: 12500, y: 5200 };
+    killed.hp = 0;
+    killed.dead = true;
+    killed.destroyed = true;
+    killed.entState = EntityState.DEAD;
+    const alive = { ...createSharedBoss(), id: 920006, name: 'Ghoul', EntName: 'Ghoul', x: 12900, y: 5200 };
+    GlobalState.levelEntities.set(SCOPE, new Map<number, any>([[killed.id, killed], [alive.id, alive]]));
+
+    // The joiner arrived in a private instance and bound both to their own live copies.
+    joiner.levelInstanceId = 'private-run';
+    for (const [localId, canonicalId, x] of [[700001, 920005, 12500], [700002, 920006, 12900]] as const) {
+        joiner.entities.set(localId, {
+            id: localId,
+            name: 'Ghoul',
+            EntName: 'Ghoul',
+            isPlayer: false,
+            team: EntityTeam.ENEMY,
+            entState: EntityState.ACTIVE,
+            x,
+            y: 5200,
+            hp: 7380,
+            maxHp: 7380,
+            canonicalEntityId: canonicalId
+        });
+        joiner.entityIdAliases.set(localId, canonicalId);
+    }
+
+    // Driven through the scope guard, so the wiring is covered and not just the helper.
+    const adoptedScope = EntityHandler.ensureJcMini1PartySharedScope(joiner, DUNGEON_LEVEL, 'test_scope_adopt');
+    assert.equal(adoptedScope, SCOPE, 'the joiner should have been moved onto the party run');
+
+    assert.equal(
+        joiner.entities.has(700001),
+        false,
+        'an enemy the party already killed must not be left standing for the player who joined later'
+    );
+    assert.ok(
+        joiner.entities.has(700002),
+        'an enemy the party has not killed yet must survive the reconcile'
+    );
+}
+
+/**
+ * A party member still loading the dungeon already owns the run -- login bound them to its
+ * instance. Requiring a spawned body here is what let the next member through the door open
+ * a private run instead: their own untouched roster, their own 0% bar, and every enemy the
+ * party had already killed back on its feet.
+ */
+function testLoadingPartyMemberAnchorsTheScope(): void {
+    const loadingHost = createClient('Telahair', 85001, 50);
+    loadingHost.playerSpawned = false;
+    loadingHost.clientEntID = 0;
+    loadingHost.entities.clear();
+
+    const joiner = createClient('Lanorut', 85002, 22);
+    joiner.levelInstanceId = 'private-run';
+    GlobalState.partyGroups.set(8805, {
+        id: 8805,
+        leader: 'Telahair',
+        members: ['Telahair', 'Lanorut'],
+        locked: false
+    });
+    GlobalState.partyByMember.set('telahair', 8805);
+    GlobalState.partyByMember.set('lanorut', 8805);
+    GlobalState.refreshSessionIndexes(loadingHost);
+    GlobalState.refreshSessionIndexes(joiner);
+
+    const adopted = EntityHandler.ensureJcMini1PartySharedScope(joiner, DUNGEON_LEVEL, 'test_loading_anchor');
+
+    assert.equal(adopted, SCOPE, 'a party member still loading must still anchor the run');
+    assert.equal(joiner.levelInstanceId, INSTANCE_ID, 'the joiner must adopt the loading member\'s instance');
+
+    // A member walking *out* has had their instance binding cleared, and must not anchor.
+    const leaver = createClient('Telahair', 85003, 50);
+    leaver.playerSpawned = false;
+    leaver.levelInstanceId = '';
+    const stranded = createClient('Lanorut', 85004, 22);
+    stranded.levelInstanceId = 'own-run';
+    GlobalState.partyByMember.set('telahair', 8805);
+    GlobalState.partyByMember.set('lanorut', 8805);
+    GlobalState.sessionsByToken.delete(loadingHost.token);
+    GlobalState.sessionsByToken.delete(joiner.token);
+    GlobalState.refreshSessionIndexes(leaver);
+    GlobalState.refreshSessionIndexes(stranded);
+
+    EntityHandler.ensureJcMini1PartySharedScope(stranded, DUNGEON_LEVEL, 'test_leaver_anchor');
+    assert.equal(
+        stranded.levelInstanceId,
+        'own-run',
+        'a party member walking out of the dungeon must not hand their instance to anybody'
+    );
+}
+
+/**
+ * The progress bar is resolved against the scope the session is in. A joiner who spent a
+ * moment in a private run had it resolved there -- 0% -- and nothing re-sent it when the
+ * scope guard moved them onto the party's 25% run.
+ */
+function testAdoptingThePartyRunResendsItsProgress(): void {
+    const host = createClient('Telahair', 86001, 50);
+    const joiner = createClient('Lanorut', 86002, 22);
+    joiner.levelInstanceId = 'private-run';
+    GlobalState.partyGroups.set(8806, {
+        id: 8806,
+        leader: 'Telahair',
+        members: ['Telahair', 'Lanorut'],
+        locked: false
+    });
+    GlobalState.partyByMember.set('telahair', 8806);
+    GlobalState.partyByMember.set('lanorut', 8806);
+    GlobalState.refreshSessionIndexes(host);
+    GlobalState.refreshSessionIndexes(joiner);
+
+    let syncedFor: Client | null = null;
+    const originalSync = LevelHandler.syncSharedDungeonQuestProgressState;
+    (LevelHandler as any).syncSharedDungeonQuestProgressState = (client: Client) => {
+        syncedFor = client;
+    };
+    try {
+        EntityHandler.ensureJcMini1PartySharedScope(joiner, DUNGEON_LEVEL, 'test_progress_resync');
+    } finally {
+        (LevelHandler as any).syncSharedDungeonQuestProgressState = originalSync;
+    }
+
+    assert.equal(joiner.levelInstanceId, INSTANCE_ID, 'the joiner should have adopted the party run');
+    assert.equal(
+        syncedFor,
+        joiner,
+        'adopting the party run must re-send its progress, or the joiner keeps the empty bar'
+    );
+}
+
+/**
+ * An enemy the party killed before this player arrived must not be shown dying. The HP
+ * drain and the DEAD state converge a copy the player was fighting; for a first-sight copy
+ * they make the joiner watch it spawn in and die.
+ */
+function testAlreadyDeadEnemyIsNeverShownToAJoiner(): void {
+    const joiner = createClient('Lanorut', 87001, 22);
+    const sent: number[] = [];
+    (joiner as any).send = (packetId: number) => {
+        sent.push(packetId);
+    };
+
+    (EntityHandler as any).destroyDeadServerAuthorityLocalProxy(
+        joiner,
+        { id: 700010, name: 'Ghoul', EntName: 'Ghoul', team: EntityTeam.ENEMY, x: 12500, y: 5200 },
+        700010
+    );
+
+    assert.deepEqual(sent, [0x0D], 'a never-seen dead enemy should only be removed, never animated into a death');
+    assert.equal(joiner.entities.has(700010), false, 'the local copy must not be left behind');
+}
+
+/**
+ * The reset that wipes a finished run must never fire on one that is being played.
+ *
+ * "Is anybody standing here" was the only test, and it required a spawned body -- so a
+ * single moment where the other player was mid-load read as an empty scope and the joiner's
+ * entry deleted the whole run: shared progress back to 0%, every enemy the party had killed
+ * standing up again. Exactly the reported "I joined at 25% and it became 0% with the
+ * enemies back".
+ */
+function testJoiningDoesNotWipeARunInProgress(): void {
+    const loadingHost = createClient('Telahair', 88001, 50);
+    loadingHost.playerSpawned = false;
+    loadingHost.clientEntID = 0;
+    loadingHost.entities.clear();
+
+    const joiner = createClient('Lanorut', 88002, 22);
+
+    const killed = { ...createSharedBoss(), id: 920005, name: 'Ghoul', EntName: 'Ghoul' };
+    killed.hp = 0;
+    killed.dead = true;
+    killed.destroyed = true;
+    killed.entState = EntityState.DEAD;
+    GlobalState.levelEntities.set(SCOPE, new Map<number, any>([[killed.id, killed]]));
+
+    (EntityHandler as any).resetFinishedDungeonRunScope(joiner, DUNGEON_LEVEL);
+
+    assert.ok(
+        GlobalState.levelEntities.has(SCOPE),
+        'a run whose party member is still loading must not be wiped by the next player entering'
+    );
+    assert.equal(
+        GlobalState.levelEntities.get(SCOPE)?.get(920005)?.dead,
+        true,
+        'the enemies the party already killed must stay dead'
+    );
+
+    // Progress alone is enough to veto it, even with nobody else connected at all.
+    GlobalState.sessionsByToken.delete(loadingHost.token);
+    GlobalState.levelQuestProgress.set(SCOPE, { progress: 25, authorityToken: loadingHost.token });
+    (EntityHandler as any).resetFinishedDungeonRunScope(joiner, DUNGEON_LEVEL);
+    assert.ok(
+        GlobalState.levelEntities.has(SCOPE),
+        'a run with recorded progress must not be wiped even when nobody is standing in it'
+    );
+    GlobalState.levelQuestProgress.delete(SCOPE);
+}
+
+/**
+ * Health corrections must reach a viewer who is drawing the enemy under an id of their own
+ * that was never bound. Skipping them is an enemy dead on one screen and still standing on
+ * the other; sending the canonical copy instead hands that client a second enemy.
+ */
+function testUnboundCopyIsBoundRatherThanSkippedOrDuplicated(): void {
+    const bystander = createClient('Lanorut', 89001, 22);
+    bystander.currentRoomId = 3;
+
+    const boss = createSharedBoss();
+    GlobalState.levelEntities.set(SCOPE, new Map<number, any>([[boss.id, boss]]));
+    bystander.entities.set(600031, {
+        id: 600031,
+        name: 'TowerGuard2',
+        EntName: 'TowerGuard2',
+        isPlayer: false,
+        team: EntityTeam.ENEMY,
+        entState: EntityState.ACTIVE,
+        x: boss.x + 15,
+        y: boss.y,
+        hp: 100000,
+        maxHp: 100000
+    });
+
+    const seeded: number[] = [];
+    const originalSendEntity = (EntityHandler as any).sendEntity;
+    (EntityHandler as any).sendEntity = (_viewer: Client, entity: any) => {
+        seeded.push(Number(entity?.id ?? 0));
+    };
+    let known = false;
+    try {
+        known = (CombatHandler as any).ensureServerAuthorityNpcKnown(bystander, SCOPE, boss, 'test');
+    } finally {
+        (EntityHandler as any).sendEntity = originalSendEntity;
+    }
+
+    assert.equal(known, true, 'a viewer drawing the enemy must count as knowing it');
+    assert.deepEqual(seeded, [], 'binding the copy they already have must not send them a second one');
+    assert.equal(
+        EntityHandler.getRegisteredHostileLocalIdForViewer(bystander, boss),
+        600031,
+        'the copy they are drawing must end up bound to the canonical'
+    );
+}
+
 function run(): void {
     ensureDataLoaded();
 
@@ -716,6 +1100,22 @@ function run(): void {
         testHostileHealthCorrectionsUseTheViewersOwnId();
         resetState();
         testRoomChangePushesThePlayerToEveryoneElse();
+        resetState();
+        testServerOwnedHostilesDropLootForTheWholeParty();
+        resetState();
+        testLootDropsWhereTheEnemyActuallyDied();
+        resetState();
+        testJoiningAPartyRunRemovesEnemiesItAlreadyKilled();
+        resetState();
+        testLoadingPartyMemberAnchorsTheScope();
+        resetState();
+        testAdoptingThePartyRunResendsItsProgress();
+        resetState();
+        testAlreadyDeadEnemyIsNeverShownToAJoiner();
+        resetState();
+        testJoiningDoesNotWipeARunInProgress();
+        resetState();
+        testUnboundCopyIsBoundRatherThanSkippedOrDuplicated();
         console.log('party dungeon sync regression passed');
     } finally {
         resetState();

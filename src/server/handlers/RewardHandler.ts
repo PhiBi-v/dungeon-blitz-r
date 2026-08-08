@@ -1425,8 +1425,12 @@ export class RewardHandler {
                 ? Math.max(1, Math.floor(maxHp * 0.15))
                 : 0,
             gold: GameData.calculateNpcGold(entName, entLevel),
-            worldX: Math.round(Number(sourceEntity.x ?? sourceEntity.pos_x ?? 0) || 0),
-            worldY: Math.round(Number(sourceEntity.y ?? sourceEntity.pos_y ?? 0) || 0),
+            // The position recorded when the death was finalized, taken from the screen that
+            // landed the kill. `sourceEntity.x/y` is the server's own simulation of the
+            // enemy, which for a client-drawn level has drifted from where anybody saw it --
+            // that is the loot appearing scattered around the room rather than on the corpse.
+            worldX: Math.round(Number(sourceEntity.deathX ?? sourceEntity.x ?? sourceEntity.pos_x ?? 0) || 0),
+            worldY: Math.round(Number(sourceEntity.deathY ?? sourceEntity.y ?? sourceEntity.pos_y ?? 0) || 0),
             combo: 0
         };
         const dropPosition = RewardHandler.resolveDropPosition(client, sourceEntity, reward.worldX, reward.worldY);
